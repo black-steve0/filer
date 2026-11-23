@@ -16,6 +16,7 @@ use crate::{
 };
 use gpui::{prelude::*, *};
 use std::{
+    collections::HashSet,
     ops::Range,
     path::{Path, PathBuf},
     sync::Arc,
@@ -48,6 +49,9 @@ pub enum PaneEvent {
     /// Files were dropped on this pane (or on one of its folders): the
     /// Workspace copies/moves them to `dest` and refreshes every affected pane.
     Dropped { paths: Vec<PathBuf>, dest: PathBuf, copy: bool },
+    /// Picker mode only: a file was opened (double-click / Enter). The file
+    /// chooser window takes it from here instead of launching the file.
+    Picked(PathBuf),
 }
 
 /// One self-contained directory view with its own history, selection,
@@ -80,6 +84,11 @@ pub struct Pane {
     loader: Option<Arc<model::DirLoader>>,
     _load_task: Option<Task<()>>,
     restore_sel: Option<PathBuf>, // reselect this file once a reload brings it back
+    reveal: Option<PathBuf>, // select + scroll to this file when the folder finishes loading
+    picker: bool, // file-chooser mode: opening a file emits `Picked` instead of launching it
+    type_filter: Option<Arc<crate::filetype::Filter>>, // file chooser: only matching files are listed
+    multi: bool,  // file chooser that allows several files: Ctrl/Shift+click and Ctrl+A mark rows
+    marked: HashSet<PathBuf>, // the marked rows (only used when `multi`)
     path_bar: Entity<PathBar>,
     renaming: Option<(usize, LineEdit)>,
     menu: Option<(Point<Pixels>, Entity<ContextMenu>)>,
@@ -137,6 +146,11 @@ impl Pane {
             loader: None,
             _load_task: None,
             restore_sel: None,
+            reveal: None,
+            picker: false,
+            type_filter: None,
+            multi: false,
+            marked: HashSet::new(),
             path_bar,
             renaming: None,
             menu: None,
@@ -153,6 +167,82 @@ impl Pane {
 
     pub fn show_hidden(&self) -> bool {
         self.show_hidden
+    }
+
+    /// Use this pane inside a file chooser: opening a file reports it with
+    /// `PaneEvent::Picked` and nothing is launched.
+    pub fn set_picker(&mut self) {
+        self.picker = true;
+    }
+
+    /// Show only files that pass `filter` (folders always stay); `None` shows everything.
+    pub fn set_type_filter(&mut self, filter: Option<Arc<crate::filetype::Filter>>, cx: &mut Context<Self>) {
+        self.type_filter = filter;
+        self.apply_view();
+        cx.emit(PaneEvent::Changed);
+        cx.notify();
+    }
+
+    /// Let the user mark several files (Ctrl+click toggles, Shift+click marks a
+    /// range, Ctrl+A marks every file in the folder).
+    pub fn set_multi(&mut self) {
+        self.multi = true;
+    }
+
+    /// The files to hand back: every marked file, in listing order, or the one
+    /// selected file when nothing is marked. Folders are never included.
+    pub fn marked_files(&self) -> Vec<PathBuf> {
+        if self.marked.is_empty() {
+            return self.selected_file().into_iter().collect();
+        }
+        self.entries
+            .iter()
+            .filter(|e| !e.is_dir && self.marked.contains(&e.path))
+            .map(|e| e.path.clone())
+            .collect()
+    }
+
+    /// Ctrl/Shift+click on row `index`.
+    fn mark_click(&mut self, index: usize, range: bool, cx: &mut Context<Self>) {
+        let Some(entry) = self.entries.get(index) else { return };
+        if range {
+            // from the last plain-clicked row (the anchor, `selected`) to this one
+            let anchor = self.selected.unwrap_or(index);
+            let (lo, hi) = (anchor.min(index), anchor.max(index));
+            self.marked = self.entries[lo..=hi].iter().map(|e| e.path.clone()).collect();
+        } else {
+            let path = entry.path.clone();
+            if self.marked.is_empty() {
+                // the row that was selected before counts as the first marked one
+                if let Some(current) = self.selected_path() {
+                    self.marked.insert(current);
+                }
+            }
+            if !self.marked.remove(&path) {
+                self.marked.insert(path);
+            }
+            self.selected = Some(index);
+        }
+        cx.emit(PaneEvent::Changed);
+        cx.notify();
+    }
+
+    /// Ctrl+A in a multi-select chooser.
+    pub fn select_all(&mut self, cx: &mut Context<Self>) {
+        if !self.multi {
+            return;
+        }
+        self.marked = self.entries.iter().filter(|e| !e.is_dir).map(|e| e.path.clone()).collect();
+        cx.emit(PaneEvent::Changed);
+        cx.notify();
+    }
+
+    /// The selected entry when it is a file (not a folder).
+    pub fn selected_file(&self) -> Option<PathBuf> {
+        self.selected
+            .and_then(|i| self.entries.get(i))
+            .filter(|e| !e.is_dir)
+            .map(|e| e.path.clone())
     }
 
     pub fn selected_dir(&self) -> Option<PathBuf> {
@@ -371,6 +461,29 @@ impl Pane {
         self.reload(cx);
     }
 
+    /// Show the folder that holds `file` with `file` selected and in view
+    /// (another app asked us to "show in folder"). The folder is reloaded
+    /// when the file is not in the listing yet, e.g. a download that just finished.
+    pub fn reveal(&mut self, file: PathBuf, cx: &mut Context<Self>) {
+        let Some(dir) = file.parent().map(Path::to_path_buf) else { return };
+        if dir != self.path {
+            self.reveal = Some(file);
+            self.navigate(dir, cx); // loads, then the load task picks `reveal` up
+            return;
+        }
+        if self.loading {
+            self.reveal = Some(file); // the load already running will find it
+            return;
+        }
+        if let Some(i) = self.entries.iter().position(|e| e.path == file) {
+            self.select(i, cx);
+        } else {
+            self.filter = None; // it may just be filtered out
+            self.reveal = Some(file);
+            self.reload(cx);
+        }
+    }
+
     pub fn back(&mut self, cx: &mut Context<Self>) {
         if let Some(prev) = self.back.pop() {
             self.filter = None;
@@ -402,7 +515,7 @@ impl Pane {
         }
     }
 
-    fn selected_path(&self) -> Option<PathBuf> {
+    pub fn selected_path(&self) -> Option<PathBuf> {
         self.selected.and_then(|i| self.entries.get(i)).map(|e| e.path.clone())
     }
 
@@ -442,6 +555,7 @@ impl Pane {
     }
 
     fn select(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.marked.clear(); // a plain click or arrow key ends a multi-selection
         self.selected = Some(index);
         self.scroll_nearest(index);
         cx.emit(PaneEvent::Changed);
@@ -474,6 +588,8 @@ impl Pane {
         let Some(entry) = self.entries.get(index).cloned() else { return };
         if entry.is_dir {
             self.navigate(entry.path, cx);
+        } else if self.picker {
+            cx.emit(PaneEvent::Picked(entry.path));
         } else {
             model::open_external(&entry.path);
         }
@@ -642,10 +758,12 @@ impl Pane {
         // the filter (text query + folder/file chip) only applies while the bar is open
         let query = self.filter.as_ref().map(|f| Query::parse(&f.text, self.filter_case));
         let kind = if self.filter.is_some() { self.filter_kind } else { KindFilter::All };
+        let type_filter = self.type_filter.clone();
         self.entries = self
             .all
             .iter()
             .filter(|e| kind.allows(e.is_dir) && query.as_ref().map_or(true, |q| q.matches(e)))
+            .filter(|e| e.is_dir || type_filter.as_ref().map_or(true, |f| f.matches(&e.name)))
             .cloned()
             .collect();
         let cfg = settings::get();
@@ -862,6 +980,7 @@ impl Pane {
         self.all.clear();
         self.entries.clear();
         self.selected = None;
+        self.marked.clear();
         self.renaming = None;
         self.menu = None;
         self.error = None;
@@ -899,6 +1018,14 @@ impl Pane {
                                 pane.restore_sel = None;
                             } else if finished {
                                 pane.restore_sel = None;
+                            }
+                        }
+                        if finished {
+                            if let Some(file) = pane.reveal.take() {
+                                if let Some(i) = pane.entries.iter().position(|e| e.path == file) {
+                                    pane.selected = Some(i);
+                                    pane.scroll_nearest(i);
+                                }
                             }
                         }
                         cx.emit(PaneEvent::Changed);
@@ -939,7 +1066,7 @@ impl Pane {
             .filter_map(|i| {
                 let e = self.entries.get(i)?;
                 let row = {
-                let selected = self.selected == Some(i);
+                let selected = self.selected == Some(i) || self.marked.contains(&e.path);
                 let size = if e.is_dir { String::new() } else { model::format_size(e.size) };
 
                 let name_el: AnyElement = match &self.renaming {
@@ -1078,6 +1205,11 @@ impl Pane {
                             this.menu = None;
                             window.focus(&this.focus);
                             cx.emit(PaneEvent::Activated);
+                            // multi-select chooser: Ctrl+click toggles, Shift+click marks a range
+                            if this.multi && (ev.modifiers.control || ev.modifiers.shift) {
+                                this.mark_click(i, ev.modifiers.shift, cx);
+                                return;
+                            }
                             // double-click mode opens here. Single-click mode opens on
                             // mouse-up instead (see below) so that pressing a row can
                             // still turn into a drag.
@@ -1096,6 +1228,7 @@ impl Pane {
                             // first click of a single-click open, on the row that was
                             // pressed, and not the end of a drag
                             if single_click
+                                && !(this.multi && (ev.modifiers.control || ev.modifiers.shift))
                                 && ev.click_count == 1
                                 && this.selected == Some(i)
                                 && this.renaming.is_none()
@@ -1185,6 +1318,7 @@ impl Render for Pane {
                     this.select(0, cx);
                 }
             }))
+            .on_action(cx.listener(|this, _: &SelectAll, _, cx| this.select_all(cx)))
             .on_action(cx.listener(|this, _: &SelectLast, _, cx| {
                 if !this.entries.is_empty() {
                     let last = this.entries.len() - 1;

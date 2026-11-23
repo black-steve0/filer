@@ -8,12 +8,15 @@ name = "filer"
 path = "src/main.rs"
 
 [dependencies]
+zbus = "5"
 gpui = "0.2"
 dirs = "5"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 raw-window-handle = "0.6"
 wayland-client = "0.31"
 wayland-backend = { version = "0.3", features = ["client_system"] }
+async-channel = "2"
+wayland-protocols = { version = "0.32", features = ["client", "unstable"] }
 
 [patch.crates-io]
 xattr = { path = "vendor/xattr" }

@@ -1,0 +1,4 @@
+[D-BUS Service]
+Name=org.freedesktop.FileManager1
+# install.sh rewrites Exec to the absolute path of the installed binary
+Exec=/usr/bin/filer --dbus-activated

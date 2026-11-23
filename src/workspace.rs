@@ -12,6 +12,7 @@ use crate::{
         statusbar::StatusBar,
         toolbar::Toolbar,
     },
+    dbus::{Request, Show},
     dragout, model,
     settings::{self, Settings, SettingsChanged},
     theme,
@@ -36,6 +37,9 @@ pub struct Workspace {
     refocus: bool,
     /// Settings as of the last change, to tell what the user just touched.
     prev: Arc<Settings>,
+    /// Started by D-Bus activation: the first request from another app takes
+    /// over the lone default pane instead of opening a second one.
+    adopt_first_request: bool,
 }
 
 /// Run a no-window method on the active pane when `$action` fires.
@@ -51,7 +55,7 @@ macro_rules! on_pane {
 impl Workspace {
     /// One pane per folder in `paths` (command-line arguments); none given
     /// means a single pane in the startup folder from Settings.
-    pub fn new(mut paths: Vec<PathBuf>, cx: &mut Context<Self>) -> Self {
+    pub fn new(mut paths: Vec<PathBuf>, dbus_activated: bool, cx: &mut Context<Self>) -> Self {
         if paths.is_empty() {
             paths.push(settings::get().startup_dir());
         }
@@ -74,6 +78,7 @@ impl Workspace {
             active: 0,
             refocus: false,
             prev: settings::get(),
+            adopt_first_request: dbus_activated,
         };
         for path in paths {
             let pane = this.new_pane(path, cx);
@@ -193,6 +198,44 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Another app asked (over D-Bus) to show folders or reveal files, e.g.
+    /// Firefox "Open Containing Folder" or Discord "Show in Folder".
+    ///
+    /// Each target goes to the pane that already shows its folder; if there is
+    /// none, a new pane opens next to the active one, so whatever the user is
+    /// looking at stays put. The last target ends up active and focused.
+    pub fn handle_request(&mut self, req: Request, window: &mut Window, cx: &mut Context<Self>) {
+        // right after D-Bus activation the only pane is the default one nobody asked for
+        let mut adopt = std::mem::take(&mut self.adopt_first_request) && self.panes.len() == 1;
+        for path in req.paths {
+            // (folder to show, file to select inside it)
+            let (dir, select) = match req.kind {
+                Show::Folders if path.is_dir() => (path, None),
+                _ => match path.parent() {
+                    Some(parent) => (parent.to_path_buf(), Some(path)),
+                    None => (path, None), // "/" has no parent
+                },
+            };
+            let at = match self.panes.iter().position(|p| p.read(cx).path() == dir.as_path()) {
+                Some(i) => i,
+                None if std::mem::take(&mut adopt) => {
+                    self.panes[0].update(cx, |p, cx| p.navigate(dir, cx));
+                    0
+                }
+                None => self.add_pane(dir, cx),
+            };
+            if let Some(file) = select {
+                self.panes[at].update(cx, |p, cx| p.reveal(file, cx));
+            }
+            self.set_active(at, cx);
+        }
+        self.focus_active(window, cx);
+        window.activate_window();
+        // the caller's xdg-activation token lets the compositor really focus us, not just flag us
+        crate::activation::activate(window, &req.startup_id);
+        cx.notify();
+    }
+
     fn add_place(&mut self, cx: &mut Context<Self>) {
         let path = {
             let pane = self.panes[self.active].read(cx);
@@ -257,6 +300,7 @@ fn on_pane(&mut self, pane: Entity<Pane>, event: &PaneEvent, cx: &mut Context<Se
             PaneEvent::Dropped { paths, dest, copy } => {
                 self.transfer(paths.clone(), dest.clone(), *copy, cx);
             }
+            PaneEvent::Picked(_) => {} // only panes inside a file chooser emit this
         }
     }
 

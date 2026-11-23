@@ -1,0 +1,4 @@
+[D-BUS Service]
+Name=org.freedesktop.impl.portal.desktop.filer
+# install.sh rewrites Exec to the absolute path of the installed binary
+Exec=/usr/bin/filer --portal-backend

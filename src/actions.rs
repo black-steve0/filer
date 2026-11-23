@@ -25,7 +25,7 @@ actions!(
         ToggleColType, ToggleColSize, ToggleColModified, ToggleColPerms,
         // pane-local (handled by the focused Pane)
         SelectPrev, SelectNext, SelectFirst, SelectLast,
-        SelectPageUp, SelectPageDown, CloseMenu,
+        SelectPageUp, SelectPageDown, SelectAll, CloseMenu,
     ]
 );
 
@@ -44,6 +44,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("pageup", SelectPageUp, list),
         KeyBinding::new("pagedown", SelectPageDown, list),
         KeyBinding::new("escape", CloseMenu, list),
+        KeyBinding::new("ctrl-a", SelectAll, list),
         // file actions
         KeyBinding::new("enter", OpenSelected, list),
         KeyBinding::new("backspace", GoUp, list),
