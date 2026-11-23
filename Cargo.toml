@@ -1,7 +1,11 @@
 [package]
-name = "gpui-explorer"
+name = "filer"
 version = "0.1.0"
 edition = "2021"
+
+[[bin]]
+name = "filer"
+path = "src/main.rs"
 
 [dependencies]
 gpui = "0.2"

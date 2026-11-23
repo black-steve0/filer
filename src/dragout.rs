@@ -104,9 +104,8 @@ fn setup(window: &Window) -> Result<Ctx, String> {
     else {
         return Err("not running on Wayland".into());
     };
-    let handle =
-        HasWindowHandle::window_handle(window).map_err(|e| e.to_string())?;
-    
+    let handle = HasWindowHandle::window_handle(window).map_err(|e| e.to_string())?;
+
     let RawWindowHandle::Wayland(s) = handle.as_raw() else {
         return Err("Expected Wayland window".into());
     };
@@ -131,18 +130,25 @@ fn worker(display: usize, surface: usize, tx: mpsc::Sender<Result<Ctx, String>>)
         started: Instant::now(),
         payload: String::new(),
     }));
-    let mut state = State { shared: shared.clone(), pointer: None };
+    let mut state = State {
+        shared: shared.clone(),
+        pointer: None,
+    };
 
     let built = (|| -> Result<_, String> {
         // attach to gpui's connection instead of opening a second one
         let backend = unsafe { Backend::from_foreign_display(display as *mut _) };
         let conn = Connection::from_backend(backend);
-        let (globals, mut queue) = registry_queue_init::<State>(&conn).map_err(|e| e.to_string())?;
+        let (globals, mut queue) =
+            registry_queue_init::<State>(&conn).map_err(|e| e.to_string())?;
         let qh = queue.handle();
 
-        let seat: WlSeat = globals.bind(&qh, 1..=7, ()).map_err(|e| format!("no wl_seat: {e}"))?;
-        let manager: WlDataDeviceManager =
-            globals.bind(&qh, 1..=3, ()).map_err(|e| format!("no wl_data_device_manager: {e}"))?;
+        let seat: WlSeat = globals
+            .bind(&qh, 1..=7, ())
+            .map_err(|e| format!("no wl_seat: {e}"))?;
+        let manager: WlDataDeviceManager = globals
+            .bind(&qh, 1..=3, ())
+            .map_err(|e| format!("no wl_data_device_manager: {e}"))?;
         let device = manager.get_data_device(&seat, &qh, ());
 
         // the seat announces its pointer; a second round trip delivers our wl_pointer
@@ -157,7 +163,17 @@ fn worker(display: usize, surface: usize, tx: mpsc::Sender<Result<Ctx, String>>)
             .map_err(|e| e.to_string())?;
         let surface = WlSurface::from_id(&conn, id).map_err(|e| e.to_string())?;
 
-        Ok((Ctx { conn, qh, shared: shared.clone(), manager, device, surface }, queue))
+        Ok((
+            Ctx {
+                conn,
+                qh,
+                shared: shared.clone(),
+                manager,
+                device,
+                surface,
+            },
+            queue,
+        ))
     })();
 
     let (ctx, mut queue) = match built {
@@ -216,7 +232,8 @@ pub fn start(paths: &[PathBuf]) -> Result<(), String> {
         if ctx.manager.version() >= 3 {
             source.set_actions(DndAction::Copy);
         }
-        ctx.device.start_drag(Some(&source), &ctx.surface, None, serial);
+        ctx.device
+            .start_drag(Some(&source), &ctx.surface, None, serial);
         ctx.conn.flush().map_err(|e| e.to_string())
     })();
     if result.is_err() {
@@ -269,7 +286,10 @@ impl Dispatch<WlSeat, ()> for State {
         _: &Connection,
         qh: &QueueHandle<Self>,
     ) {
-        if let wl_seat::Event::Capabilities { capabilities: WEnum::Value(caps) } = event {
+        if let wl_seat::Event::Capabilities {
+            capabilities: WEnum::Value(caps),
+        } = event
+        {
             if caps.contains(wl_seat::Capability::Pointer) && state.pointer.is_none() {
                 state.pointer = Some(seat.get_pointer(qh, ()));
             }

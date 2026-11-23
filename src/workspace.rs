@@ -49,8 +49,12 @@ macro_rules! on_pane {
 }
 
 impl Workspace {
-    pub fn new(cx: &mut Context<Self>) -> Self {
-        let start = settings::get().startup_dir();
+    /// One pane per folder in `paths` (command-line arguments); none given
+    /// means a single pane in the startup folder from Settings.
+    pub fn new(mut paths: Vec<PathBuf>, cx: &mut Context<Self>) -> Self {
+        if paths.is_empty() {
+            paths.push(settings::get().startup_dir());
+        }
 
         let menubar = cx.new(|_| MenuBar::new());
         let toolbar = cx.new(|_| Toolbar::default());
@@ -71,8 +75,10 @@ impl Workspace {
             refocus: false,
             prev: settings::get(),
         };
-        let first = this.new_pane(start, cx);
-        this.panes.push(first);
+        for path in paths {
+            let pane = this.new_pane(path, cx);
+            this.panes.push(pane);
+        }
         this.set_active(0, cx);
         this
     }
