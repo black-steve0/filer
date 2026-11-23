@@ -4,6 +4,7 @@
 use crate::{
     actions::*,
     components::{
+        dnd::FileDrag,
         menubar::MenuBar,
         pane::{Pane, PaneEvent},
         resize::grip,
@@ -11,6 +12,7 @@ use crate::{
         statusbar::StatusBar,
         toolbar::Toolbar,
     },
+    dragout, model,
     settings::{self, Settings, SettingsChanged},
     theme,
 };
@@ -221,6 +223,9 @@ impl Workspace {
                 let path = path.clone();
                 self.active_pane().update(cx, |p, cx| p.open_terminal_at(path, cx));
             }
+            SidebarEvent::DropInto { paths, dest, copy } => {
+                self.transfer(paths.clone(), dest.clone(), *copy, cx);
+            }
         }
     }
 
@@ -243,7 +248,33 @@ fn on_pane(&mut self, pane: Entity<Pane>, event: &PaneEvent, cx: &mut Context<Se
                     self.refresh_chrome(cx);
                 }
             }
+            PaneEvent::Dropped { paths, dest, copy } => {
+                self.transfer(paths.clone(), dest.clone(), *copy, cx);
+            }
         }
+    }
+
+    /// Copy or move `paths` into `dest` (a drop from another split, from the
+    /// sidebar, or from another application), then bring every pane that
+    /// shows an affected folder up to date.
+    fn transfer(&mut self, paths: Vec<PathBuf>, dest: PathBuf, copy: bool, cx: &mut Context<Self>) {
+        let result = model::transfer(&paths, &dest, copy);
+        for pane in &self.panes {
+            pane.update(cx, |p, cx| p.refresh_if_showing(&result.touched, cx));
+        }
+        // report failures in the pane that was dropped on (else the active one);
+        // set after the refresh, because a reload clears the pane's message
+        if !result.errors.is_empty() {
+            let target = self
+                .panes
+                .iter()
+                .find(|p| p.read(cx).path() == dest.as_path())
+                .cloned()
+                .unwrap_or_else(|| self.active_pane());
+            let msg = format!("Drop failed: {}", result.errors.join("; "));
+            target.update(cx, |p, cx| p.set_error(msg, cx));
+        }
+        self.refresh_chrome(cx);
     }
 }
 
@@ -318,6 +349,33 @@ impl Render for Workspace {
             .on_action(on_pane!(cx, OpenTerminal, open_terminal))
             .on_action(on_pane!(cx, OpenTerminalInSelected, open_terminal_selected))
             .on_action(on_pane!(cx, Duplicate, duplicate))
+            .on_action(on_pane!(cx, DragOut, drag_out))
+            .on_action(on_pane!(cx, ExtractArchive, extract_selected))
+            .on_action(cx.listener(|this, _: &CompressZip, _, cx| {
+                this.active_pane().update(cx, |p, cx| p.compress_selected(model::Archive::Zip, cx));
+            }))
+            .on_action(cx.listener(|this, _: &CompressTarGz, _, cx| {
+                this.active_pane().update(cx, |p, cx| p.compress_selected(model::Archive::TarGz, cx));
+            }))
+            // a row dragged past the window edge becomes a real compositor drag,
+            // so it can be dropped into a browser or any other app
+            .on_drag_move::<FileDrag>(cx.listener(|this, ev: &DragMoveEvent<FileDrag>, window, cx| {
+                if !dragout::available() || ev.bounds.contains(&ev.event.position) {
+                    return;
+                }
+                let paths = ev.drag(&*cx).paths.clone();
+                match dragout::start(&paths) {
+                    // the compositor owns the pointer now: gpui will never see the
+                    // button release, so end its in-app drag here
+                    Ok(()) => {
+                        cx.stop_active_drag(window);
+                    }
+                    Err(msg) => {
+                        let pane = this.active_pane();
+                        pane.update(cx, |p, cx| p.set_error(format!("Drag out failed: {msg}"), cx));
+                    }
+                }
+            }))
             .on_action(on_pane!(cx, ToggleColType, toggle_type))
             .on_action(on_pane!(cx, ToggleColSize, toggle_size))
             .on_action(on_pane!(cx, ToggleColModified, toggle_modified))

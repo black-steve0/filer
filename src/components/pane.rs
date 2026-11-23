@@ -2,6 +2,7 @@ use crate::{
     actions::*,
     components::{
         context_menu::{ContextMenu, ContextMenuEvent},
+        dnd::{self, DragPreview, FileDrag},
         icon::{icon, image_or},
         line_edit::{EditOutcome, LineEdit},
         path_bar::{PathBar, PathBarEvent},
@@ -9,7 +10,7 @@ use crate::{
     },
     menus,
     filter::{KindFilter, Query},
-    model::{self, Entry, SortKey},
+    model::{self, Archive, Entry, SortKey},
     settings::{self, ClickMode, Settings},
     theme,
 };
@@ -44,6 +45,9 @@ pub enum PaneEvent {
     CloseRequested,
     /// Path, listing or selection changed (status bar / sidebar should refresh).
     Changed,
+    /// Files were dropped on this pane (or on one of its folders): the
+    /// Workspace copies/moves them to `dest` and refreshes every affected pane.
+    Dropped { paths: Vec<PathBuf>, dest: PathBuf, copy: bool },
 }
 
 /// One self-contained directory view with its own history, selection,
@@ -72,6 +76,7 @@ pub struct Pane {
     sort_asc: bool,
     scroll: UniformListScrollHandle,
     loading: bool,
+    job: Option<SharedString>, // "Compressing" / "Extracting" while one runs
     loader: Option<Arc<model::DirLoader>>,
     _load_task: Option<Task<()>>,
     restore_sel: Option<PathBuf>, // reselect this file once a reload brings it back
@@ -128,6 +133,7 @@ impl Pane {
             sort_asc: cfg.sort_asc,
             scroll: UniformListScrollHandle::new(),
             loading: false,
+            job: None,
             loader: None,
             _load_task: None,
             restore_sel: None,
@@ -263,6 +269,95 @@ impl Pane {
             self.closable = closable;
             cx.notify();
         }
+    }
+
+    /// Show a message in the pane (used for failed drops).
+    pub fn set_error(&mut self, msg: impl Into<SharedString>, cx: &mut Context<Self>) {
+        self.error = Some(msg.into());
+        cx.notify();
+    }
+
+    /// Re-read the folder if this pane is showing one of `dirs` (after a drop).
+    pub fn refresh_if_showing(&mut self, dirs: &[PathBuf], cx: &mut Context<Self>) {
+        if dirs.iter().any(|d| *d == self.path) {
+            self.refresh(cx);
+        }
+    }
+
+    /// Ask the Workspace to copy/move `paths` into `dest`.
+    fn drop_into(&mut self, paths: Vec<PathBuf>, dest: PathBuf, copy: bool, cx: &mut Context<Self>) {
+        if paths.is_empty() {
+            return;
+        }
+        cx.emit(PaneEvent::Activated);
+        cx.emit(PaneEvent::Dropped { paths, dest, copy });
+    }
+
+    /// Hand the selected file to a drag-source helper window so it can be
+    /// dragged into other applications.
+    pub fn drag_out(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = self.selected_path() else { return };
+        cx.spawn(async move |this, cx| {
+            let result = cx.background_executor().spawn(async move { model::drag_out(&path) }).await;
+            if let Err(msg) = result {
+                this.update(cx, |pane, cx| {
+                    pane.error = Some(format!("Drag out failed: {msg}").into());
+                    cx.notify();
+                })
+                .ok();
+            }
+        })
+        .detach();
+    }
+
+    // ---- compress / extract ----------------------------------------------
+
+    pub fn compress_selected(&mut self, kind: Archive, cx: &mut Context<Self>) {
+        let Some(src) = self.selected_path() else { return };
+        self.run_job("Compressing", move || model::compress(&src, kind), cx);
+    }
+
+    pub fn extract_selected(&mut self, cx: &mut Context<Self>) {
+        let Some(e) = self.selected.and_then(|i| self.entries.get(i)) else { return };
+        if e.is_dir || !model::is_archive(&e.name) {
+            return;
+        }
+        let src = e.path.clone();
+        self.run_job("Extracting", move || model::extract(&src), cx);
+    }
+
+    /// Run a blocking archive job off the UI thread; on success the new file or
+    /// folder is added to the listing and selected.
+    fn run_job(
+        &mut self,
+        label: &'static str,
+        job: impl FnOnce() -> Result<PathBuf, String> + Send + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        self.error = None;
+        self.job = Some(label.into());
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = cx.background_executor().spawn(async move { job() }).await;
+            this.update(cx, |pane, cx| {
+                pane.job = None;
+                match result {
+                    Ok(path) => {
+                        if path.parent() == Some(pane.path.as_path()) {
+                            pane.add_entry(&path);
+                            if let Some(i) = pane.entries.iter().position(|e| e.path == path) {
+                                pane.select(i, cx);
+                            }
+                        }
+                        cx.emit(PaneEvent::Changed);
+                    }
+                    Err(msg) => pane.error = Some(format!("{label} failed: {msg}").into()),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     pub fn navigate(&mut self, path: PathBuf, cx: &mut Context<Self>) {
@@ -711,7 +806,7 @@ impl Pane {
         self.renaming = None;
         self.selected = row;
         let entries = match row.and_then(|i| self.entries.get(i)) {
-            Some(e) => menus::row_menu(e.is_dir),
+            Some(e) => menus::row_menu(e.is_dir, !e.is_dir && model::is_archive(&e.name)),
             None => menus::background_menu(self.show_hidden),
         };
         let menu = cx.new(|_| ContextMenu::new(entries));
@@ -878,6 +973,10 @@ impl Pane {
                         .into_any_element(),
                 };
 
+                let drag = FileDrag::single(e.path.clone(), &e.name);
+                let drop_dir = e.path.clone();
+                let is_dir = e.is_dir;
+
                 div()
                     .id(("row", i))
                     .flex()
@@ -889,6 +988,24 @@ impl Pane {
                     .h(px(row_h))
                     .overflow_hidden()
                     .cursor_pointer()
+                    // drag this row: to the other split, onto a folder, onto a
+                    // sidebar place (moves; hold Ctrl to copy)
+                    .on_drag(drag, |drag, _offset, _window, cx| cx.new(|_| DragPreview::new(drag)))
+                    // a folder row is itself a drop target (files from the app or from outside)
+                    .when(is_dir, |d| {
+                        let dest_a = drop_dir.clone();
+                        let dest_b = drop_dir.clone();
+                        d.drag_over::<FileDrag>(|s, _, _, _| s.bg(dnd::target_tint()))
+                            .drag_over::<ExternalPaths>(|s, _, _, _| s.bg(dnd::target_tint()))
+                            .on_drop(cx.listener(move |this, drag: &FileDrag, window, cx| {
+                                let copy = dnd::internal_is_copy(window);
+                                this.drop_into(drag.paths.clone(), dest_a.clone(), copy, cx);
+                            }))
+                            .on_drop(cx.listener(move |this, ext: &ExternalPaths, window, cx| {
+                                let copy = dnd::external_is_copy(window);
+                                this.drop_into(ext.paths().to_vec(), dest_b.clone(), copy, cx);
+                            }))
+                    })
                     .text_color(rgb(theme::TEXT))
                     .when(selected, |d| d.bg(rgb(theme::HILITE)))
                     .when(!selected, |d| d.hover(|s| s.bg(rgb(theme::HOVER_ROW))))
@@ -961,14 +1078,30 @@ impl Pane {
                             this.menu = None;
                             window.focus(&this.focus);
                             cx.emit(PaneEvent::Activated);
-                            // single-click mode opens on the first click only: the
-                            // second click of a double-click would hit the new folder
-                            let open = if single_click { ev.click_count == 1 } else { ev.click_count >= 2 };
+                            // double-click mode opens here. Single-click mode opens on
+                            // mouse-up instead (see below) so that pressing a row can
+                            // still turn into a drag.
+                            let open = !single_click && ev.click_count >= 2;
                             if open {
                                 this.selected = Some(i);
                                 this.open_index(i, cx);
                             } else {
                                 this.select(i, cx);
+                            }
+                        }),
+                    )
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(move |this, ev: &MouseUpEvent, _, cx| {
+                            // first click of a single-click open, on the row that was
+                            // pressed, and not the end of a drag
+                            if single_click
+                                && ev.click_count == 1
+                                && this.selected == Some(i)
+                                && this.renaming.is_none()
+                                && !cx.has_active_drag()
+                            {
+                                this.open_index(i, cx);
                             }
                         }),
                     )
@@ -1029,6 +1162,19 @@ impl Render for Pane {
             .border_1()
             .border_color(border)
             .text_color(rgb(theme::TEXT))
+            // dropping on the pane itself (not on a folder row) goes into the folder it shows
+            .drag_over::<FileDrag>(|s, _, _, _| s.border_color(rgb(theme::ACCENT)).bg(theme::alpha(theme::ACCENT, 0x14)))
+            .drag_over::<ExternalPaths>(|s, _, _, _| s.border_color(rgb(theme::ACCENT)).bg(theme::alpha(theme::ACCENT, 0x14)))
+            .on_drop(cx.listener(|this, drag: &FileDrag, window, cx| {
+                let copy = dnd::internal_is_copy(window);
+                let dest = this.path.clone();
+                this.drop_into(drag.paths.clone(), dest, copy, cx);
+            }))
+            .on_drop(cx.listener(|this, ext: &ExternalPaths, window, cx| {
+                let copy = dnd::external_is_copy(window);
+                let dest = this.path.clone();
+                this.drop_into(ext.paths().to_vec(), dest, copy, cx);
+            }))
             // list navigation (pane-local actions)
             .on_action(cx.listener(|this, _: &SelectPrev, _, cx| this.move_selection(-1, cx)))
             .on_action(cx.listener(|this, _: &SelectNext, _, cx| this.move_selection(1, cx)))
@@ -1362,6 +1508,9 @@ impl Render for Pane {
                     .clone()
                     .map(|e| div().p_3().text_color(rgb(theme::ERROR)).child(e)),
             )
+            .children(self.job.clone().map(|j| {
+                div().px_3().py_1().text_xs().text_color(rgb(theme::OVERLAY)).child(format!("{j}..."))
+            }))
             .children(self.loading.then(|| {
                 div()
                     .px_3()

@@ -13,6 +13,10 @@ actions!(
         CopyFile, CutFile, PasteFile, FindInPane, AddPlace, RemovePlace,
         // terminal in the selected folder (right-click on a folder)
         OpenTerminalInSelected,
+        // hand the selected file to a small drag-source window (drag out of the app)
+        DragOut,
+        // archives: act on the selected file or folder
+        CompressZip, CompressTarGz, ExtractArchive,
         // sidebar "Places" context menu (act on the place that was right-clicked)
         PlaceOpen, PlaceOpenInOtherPane, PlaceOpenTerminal, PlaceCopyPath,
         PlaceRename, PlaceMoveUp, PlaceMoveDown, PlaceChangeColor,
@@ -46,6 +50,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("delete", MoveToTrash, list),
         KeyBinding::new("f2", StartRename, list),
         KeyBinding::new("ctrl-d", Duplicate, list),
+        KeyBinding::new("ctrl-shift-d", DragOut, list),
         KeyBinding::new("tab", SwitchPane, list),
         KeyBinding::new("ctrl-c", CopyFile, list),
         KeyBinding::new("ctrl-x", CutFile, list),

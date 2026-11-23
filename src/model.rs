@@ -527,3 +527,258 @@ pub fn paste(src: &Path, cut: bool, dir: &Path) -> io::Result<PathBuf> {
     }
     Ok(dst)
 }
+
+// ---- drag and drop ----------------------------------------------------------
+
+/// Result of a drop: which folders changed (so panes can refresh) and what failed.
+pub struct Transfer {
+    pub touched: Vec<PathBuf>,
+    pub errors: Vec<String>,
+}
+
+/// Copy (`copy`) or move every path in `paths` into the folder `dest`.
+pub fn transfer(paths: &[PathBuf], dest: &Path, copy: bool) -> Transfer {
+    let mut t = Transfer { touched: vec![dest.to_path_buf()], errors: Vec::new() };
+    if !dest.is_dir() {
+        t.errors.push(format!("\"{}\" is not a folder", dest.display()));
+        return t;
+    }
+    for src in paths {
+        if src == dest {
+            continue; // a folder dropped on itself
+        }
+        let name = src.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        match paste(src, !copy, dest) {
+            Ok(_) => {
+                if !copy {
+                    if let Some(parent) = src.parent() {
+                        t.touched.push(parent.to_path_buf());
+                    }
+                }
+            }
+            Err(e) => t.errors.push(format!("\"{name}\": {e}")),
+        }
+    }
+    t.touched.sort();
+    t.touched.dedup();
+    t
+}
+
+/// gpui can receive drops from other apps but cannot start an OS-level drag
+/// out of the window, so dragging *out* goes through a tiny helper window
+/// that shows the file and acts as the drag source (`ripdrag`, `dragon-drop`).
+pub fn drag_out(path: &Path) -> Result<(), String> {
+    for tool in ["ripdrag", "dragon-drop", "dragon", "xdragon"] {
+        match Command::new(tool)
+            .arg("-x") // close the helper after one successful drop
+            .arg(path)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            Ok(mut child) => {
+                std::thread::spawn(move || {
+                    let _ = child.wait(); // reap it, no zombie
+                });
+                return Ok(());
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(format!("{tool}: {e}")),
+        }
+    }
+    Err("no drag-out helper found (install ripdrag or dragon-drop)".into())
+}
+
+
+// ---- archives (compress / extract) ------------------------------------------
+//
+// Done with the usual command-line tools, so there are no extra crates: the
+// first tool of each list that is installed is used. Both functions block, so
+// call them from a background thread.
+
+#[derive(Clone, Copy)]
+pub enum Archive {
+    Zip,
+    TarGz,
+}
+
+const TAR_EXTS: [&str; 7] = [".tar.gz", ".tar.bz2", ".tar.xz", ".tar.zst", ".tgz", ".tbz2", ".txz"];
+const SINGLE_EXTS: [&str; 4] = [".gz", ".bz2", ".xz", ".zst"];
+const OTHER_EXTS: [&str; 4] = [".zip", ".7z", ".rar", ".tar"];
+
+fn has_ext(name: &str, ext: &str) -> bool {
+    name.len() >= ext.len()
+        && name.get(name.len() - ext.len()..).is_some_and(|t| t.eq_ignore_ascii_case(ext))
+}
+
+/// Does the file name look like something `extract` can open?
+pub fn is_archive(name: &str) -> bool {
+    TAR_EXTS.iter().chain(&SINGLE_EXTS).chain(&OTHER_EXTS).any(|e| has_ext(name, e))
+}
+
+/// "photos.tar.gz" -> "photos"
+fn strip_archive_ext(name: &str) -> String {
+    for e in TAR_EXTS.iter().chain(&OTHER_EXTS).chain(&SINGLE_EXTS) {
+        if has_ext(name, e) && name.len() > e.len() {
+            return name[..name.len() - e.len()].to_string();
+        }
+    }
+    name.to_string()
+}
+
+/// `base`, or `stem 2.ext`, `stem 3.ext`, ... if taken. `ext` includes the dot (or is empty).
+fn free_name(dir: &Path, stem: &str, ext: &str) -> String {
+    let mut n = 1;
+    loop {
+        let name = if n == 1 { format!("{stem}{ext}") } else { format!("{stem} {n}{ext}") };
+        if !dir.join(&name).exists() {
+            return name;
+        }
+        n += 1;
+    }
+}
+
+/// Run the first installed tool; fail with its last stderr line if it fails.
+fn try_tools(cwd: &Path, tools: &[(&str, Vec<String>)], hint: &str) -> Result<(), String> {
+    for (tool, args) in tools {
+        match Command::new(tool)
+            .args(args)
+            .current_dir(cwd)
+            .stdin(std::process::Stdio::null())
+            .output()
+        {
+            // unzip exits 1 for harmless warnings
+            Ok(out) if out.status.success() || (*tool == "unzip" && out.status.code() == Some(1)) => {
+                return Ok(())
+            }
+            Ok(out) => {
+                let err = String::from_utf8_lossy(&out.stderr);
+                let last = err.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("unknown error");
+                return Err(format!("{tool}: {}", last.trim()));
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(format!("{tool}: {e}")),
+        }
+    }
+    Err(format!("no tool found, install {hint}"))
+}
+
+/// Compress a file or folder next to itself ("name.zip" / "name.tar.gz").
+pub fn compress(src: &Path, kind: Archive) -> Result<PathBuf, String> {
+    let parent = src.parent().ok_or("bad path")?;
+    let name = src.file_name().ok_or("bad path")?.to_string_lossy().into_owned();
+    let s = |x: &str| x.to_string();
+    let (ext, hint) = match kind {
+        Archive::Zip => (".zip", "zip, bsdtar or 7z"),
+        Archive::TarGz => (".tar.gz", "tar"),
+    };
+    let out_name = free_name(parent, &name, ext);
+    let tools: Vec<(&str, Vec<String>)> = match kind {
+        Archive::Zip => vec![
+            ("zip", vec![s("-r"), s("-q"), out_name.clone(), name.clone()]),
+            ("bsdtar", vec![s("-a"), s("-cf"), out_name.clone(), name.clone()]),
+            ("7z", vec![s("a"), s("-y"), out_name.clone(), name.clone()]),
+            ("7zz", vec![s("a"), s("-y"), out_name.clone(), name.clone()]),
+        ],
+        Archive::TarGz => vec![
+            ("tar", vec![s("-czf"), out_name.clone(), name.clone()]),
+            ("bsdtar", vec![s("-czf"), out_name.clone(), name.clone()]),
+        ],
+    };
+    let out = parent.join(&out_name);
+    let res = try_tools(parent, &tools, hint);
+    if res.is_err() {
+        let _ = std::fs::remove_file(&out); // no half-written archive
+    }
+    res.map(|_| out)
+}
+
+/// Extract into a new folder next to the archive (named after it), so an
+/// archive full of loose files can never litter the current folder.
+pub fn extract(archive: &Path) -> Result<PathBuf, String> {
+    let parent = archive.parent().ok_or("bad path")?;
+    let name = archive.file_name().ok_or("bad path")?.to_string_lossy().into_owned();
+    let dest = parent.join(free_name(parent, &strip_archive_ext(&name), ""));
+    std::fs::create_dir(&dest).map_err(|e| format!("can't create folder: {e}"))?;
+
+    let s = |x: &str| x.to_string();
+    let a = archive.to_string_lossy().into_owned();
+    let d = dest.to_string_lossy().into_owned();
+    let res = if has_ext(&name, ".zip") {
+        try_tools(
+            parent,
+            &[
+                ("unzip", vec![s("-q"), a.clone(), s("-d"), d.clone()]),
+                ("bsdtar", vec![s("-xf"), a.clone(), s("-C"), d.clone()]),
+                ("7z", vec![s("x"), s("-y"), format!("-o{d}"), a.clone()]),
+            ],
+            "unzip, bsdtar or 7z",
+        )
+    } else if has_ext(&name, ".tar") || TAR_EXTS.iter().any(|e| has_ext(&name, e)) {
+        try_tools(
+            parent,
+            &[
+                ("tar", vec![s("-xf"), a.clone(), s("-C"), d.clone()]),
+                ("bsdtar", vec![s("-xf"), a.clone(), s("-C"), d.clone()]),
+            ],
+            "tar",
+        )
+    } else if has_ext(&name, ".7z") {
+        try_tools(
+            parent,
+            &[
+                ("7z", vec![s("x"), s("-y"), format!("-o{d}"), a.clone()]),
+                ("7zz", vec![s("x"), s("-y"), format!("-o{d}"), a.clone()]),
+                ("bsdtar", vec![s("-xf"), a.clone(), s("-C"), d.clone()]),
+            ],
+            "7z",
+        )
+    } else if has_ext(&name, ".rar") {
+        try_tools(
+            parent,
+            &[
+                ("unrar", vec![s("x"), s("-y"), a.clone(), format!("{d}/")]),
+                ("7z", vec![s("x"), s("-y"), format!("-o{d}"), a.clone()]),
+                ("bsdtar", vec![s("-xf"), a.clone(), s("-C"), d.clone()]),
+            ],
+            "unrar, 7z or bsdtar",
+        )
+    } else {
+        // a single compressed file (.gz, .bz2, .xz, .zst): decompress to dest/<stem>
+        let tool = if has_ext(&name, ".gz") {
+            "gzip"
+        } else if has_ext(&name, ".bz2") {
+            "bzip2"
+        } else if has_ext(&name, ".xz") {
+            "xz"
+        } else {
+            "zstd"
+        };
+        decompress_single(tool, archive, &dest.join(strip_archive_ext(&name)))
+    };
+    if res.is_err() {
+        let _ = std::fs::remove_dir_all(&dest);
+    }
+    res.map(|_| dest)
+}
+
+fn decompress_single(tool: &str, archive: &Path, out: &Path) -> Result<(), String> {
+    let file = std::fs::File::create(out).map_err(|e| e.to_string())?;
+    match Command::new(tool)
+        .arg("-dc")
+        .arg(archive)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::from(file))
+        .stderr(std::process::Stdio::piped())
+        .output()
+    {
+        Ok(o) if o.status.success() => Ok(()),
+        Ok(o) => {
+            let err = String::from_utf8_lossy(&o.stderr);
+            Err(format!("{tool}: {}", err.lines().next().unwrap_or("failed").trim()))
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Err(format!("no tool found, install {tool}")),
+        Err(e) => Err(format!("{tool}: {e}")),
+    }
+}

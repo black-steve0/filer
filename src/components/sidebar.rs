@@ -1,6 +1,7 @@
 use crate::{
     components::{
         context_menu::{ContextMenu, ContextMenuEvent},
+        dnd::{self, FileDrag},
         icon::{find_image, image_or},
         line_edit::{EditOutcome, LineEdit},
     },
@@ -14,6 +15,8 @@ pub enum SidebarEvent {
     Navigate(PathBuf),
     OpenInOtherPane(PathBuf),
     OpenTerminal(PathBuf),
+    /// Files were dropped on a place: copy/move them into `dest`.
+    DropInto { paths: Vec<PathBuf>, dest: PathBuf, copy: bool },
 }
 
 /// Colors "Change Color" cycles through (pastel row backgrounds).
@@ -286,6 +289,8 @@ impl Render for Sidebar {
             .enumerate()
             .map(|(i, place)| {
                 let target = place.path.clone();
+                let drop_a = place.path.clone();
+                let drop_b = place.path.clone();
                 let selected = self.active.as_ref() == Some(&place.path);
                 let color = place.color;
                 let editing = matches!(&self.renaming, Some((ri, _)) if *ri == i);
@@ -346,6 +351,28 @@ impl Render for Sidebar {
                     })
                     .children(place_icon(&place.name))
                     .child(label)
+                    // drop files here to move them into this folder (Ctrl = copy);
+                    // files from other apps are copied (Shift = move)
+                    .drag_over::<FileDrag>(|s, _, _, _| {
+                        s.bg(dnd::target_tint()).border_color(rgb(theme::ACCENT))
+                    })
+                    .drag_over::<ExternalPaths>(|s, _, _, _| {
+                        s.bg(dnd::target_tint()).border_color(rgb(theme::ACCENT))
+                    })
+                    .on_drop(cx.listener(move |_, drag: &FileDrag, window, cx| {
+                        cx.emit(SidebarEvent::DropInto {
+                            paths: drag.paths.clone(),
+                            dest: drop_a.clone(),
+                            copy: dnd::internal_is_copy(window),
+                        });
+                    }))
+                    .on_drop(cx.listener(move |_, ext: &ExternalPaths, window, cx| {
+                        cx.emit(SidebarEvent::DropInto {
+                            paths: ext.paths().to_vec(),
+                            dest: drop_b.clone(),
+                            copy: dnd::external_is_copy(window),
+                        });
+                    }))
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |_, _, _, cx| {

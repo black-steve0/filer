@@ -1,5 +1,6 @@
 mod actions;
 mod components;
+mod dragout;
 mod filter;
 mod menus;
 mod model;
@@ -32,6 +33,7 @@ fn main() {
                 ..Default::default()
             },
             |window, cx| {
+                dragout::init(window); // native drag-out to other apps (Wayland)
                 let workspace = cx.new(|cx| Workspace::new(cx));
                 // give the first pane keyboard focus right away
                 workspace.update(cx, |ws, cx| ws.focus_active(window, cx));

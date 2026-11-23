@@ -41,6 +41,9 @@ pub fn edit_menu() -> Vec<MenuEntry> {
         item("duplicate", "Duplicate", "Ctrl+D", Duplicate),
         item("copy-path", "Copy Path", "Ctrl+Shift+C", CopyPath),
         item("add-place", "Add to Places", "", AddPlace),
+        item("compress", "Compress to .zip", "", CompressZip),
+        item("compress", "Compress to .tar.gz", "", CompressTarGz),
+        item("extract", "Extract Archive", "", ExtractArchive),
         item("trash", "Move to Trash", "Del", MoveToTrash),
         MenuEntry::Separator,
         item("find", "Filter...", "Ctrl+F", FindInPane),
@@ -88,7 +91,7 @@ pub fn go_menu() -> Vec<MenuEntry> {
 }
 
 /// Right-click on a file or folder.
-pub fn row_menu(is_dir: bool) -> Vec<MenuEntry> {
+pub fn row_menu(is_dir: bool, is_archive: bool) -> Vec<MenuEntry> {
     let mut v = vec![item("open", "Open", "Enter", OpenSelected)];
     if is_dir {
         v.push(item("open-other-pane", "Open in Other Pane", "", OpenInOtherPane));
@@ -103,6 +106,14 @@ pub fn row_menu(is_dir: bool) -> Vec<MenuEntry> {
     v.push(item("rename", "Rename", "F2", StartRename));
     v.push(item("duplicate", "Duplicate", "Ctrl+D", Duplicate));
     v.push(item("copy-path", "Copy Path", "Ctrl+Shift+C", CopyPath));
+    v.push(item("drag-out", "Drag Out of App...", "Ctrl+Shift+D", DragOut));
+    v.push(MenuEntry::Separator);
+    if is_archive {
+        v.push(item("extract", "Extract to Folder", "", ExtractArchive));
+    }
+    v.push(item("compress", "Compress to .zip", "", CompressZip));
+    v.push(item("compress", "Compress to .tar.gz", "", CompressTarGz));
+    v.push(MenuEntry::Separator);
     v.push(item("trash", "Move to Trash", "Del", MoveToTrash));
     v.push(MenuEntry::Separator);
     v.push(item("new-file", "New File", "Ctrl+N", NewFile));

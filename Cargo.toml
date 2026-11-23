@@ -7,6 +7,12 @@ edition = "2021"
 gpui = "0.2"
 dirs = "5"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+raw-window-handle = "0.6"
+wayland-client = "0.31"
+wayland-backend = { version = "0.3", features = ["client_system"] }
 
 [patch.crates-io]
 xattr = { path = "vendor/xattr" }
+raw-window-handle = { path = "vendor/raw-window-handle" }
+wayland-client = { path = "vendor/wayland-client" }
+wayland-backend = { path = "vendor/wayland-backend" }

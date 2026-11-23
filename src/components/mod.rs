@@ -1,6 +1,7 @@
 pub mod button;
 pub mod context_menu;
 pub mod controls;
+pub mod dnd;
 pub mod icon;
 pub mod line_edit;
 pub mod menubar;
