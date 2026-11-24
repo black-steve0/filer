@@ -8,7 +8,7 @@
 //! other way drops the sender, which the portal side reads as "cancelled".
 
 use crate::{
-    actions::{FocusPath, GoBack, GoForward, GoHome, GoUp, NewFolder, OpenSelected, Refresh, ToggleHidden},
+    actions::{FocusPath, GoToFolder, GoBack, GoForward, GoHome, GoUp, NewFolder, OpenSelected, Refresh, ToggleHidden},
     components::{
         button::button,
         controls::{checkbox, chip},
@@ -426,6 +426,9 @@ impl Render for Picker {
             }))
             .on_action(cx.listener(|this, _: &FocusPath, window, cx| {
                 this.pane.update(cx, |p, cx| p.start_path_edit(window, cx))
+            }))
+            .on_action(cx.listener(|this, _: &GoToFolder, window, cx| {
+                this.pane.update(cx, |p, cx| p.start_jump(window, cx))
             }))
             .on_action(cx.listener(|this, _: &NewFolder, window, cx| {
                 this.pane.update(cx, |p, cx| p.new_folder(window, cx))

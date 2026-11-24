@@ -87,6 +87,27 @@ pub fn go_menu() -> Vec<MenuEntry> {
         item("home", "Home", "Alt+Home", GoHome),
         MenuEntry::Separator,
         item("location", "Location...", "Ctrl+L", FocusPath),
+        item("location", "Go to Folder...", "Ctrl+P", GoToFolder),
+    ]
+}
+
+/// Right-click on several selected items (only what makes sense for a group).
+pub fn multi_menu() -> Vec<MenuEntry> {
+    vec![
+        item("open", "Open", "Enter", OpenSelected),
+        MenuEntry::Separator,
+        item("cut", "Cut", "Ctrl+X", CutFile),
+        item("copy", "Copy", "Ctrl+C", CopyFile),
+        item("paste", "Paste", "Ctrl+V", PasteFile),
+        MenuEntry::Separator,
+        item("duplicate", "Duplicate", "Ctrl+D", Duplicate),
+        item("copy-path", "Copy Paths", "Ctrl+Shift+C", CopyPath),
+        item("drag-out", "Drag Out of App...", "Ctrl+Shift+D", DragOut),
+        MenuEntry::Separator,
+        item("compress", "Compress to .zip", "", CompressZip),
+        item("compress", "Compress to .tar.gz", "", CompressTarGz),
+        MenuEntry::Separator,
+        item("trash", "Move to Trash", "Del", MoveToTrash),
     ]
 }
 

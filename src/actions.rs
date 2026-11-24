@@ -8,7 +8,7 @@ actions!(
     [
         // app-level commands (handled by Workspace)
         GoBack, GoForward, GoUp, GoHome, Refresh, ToggleHidden, SplitPane, ClosePane,
-        SwitchPane, FocusPath, OpenSelected, OpenInOtherPane, CopyPath,
+        SwitchPane, FocusPath, GoToFolder, OpenSelected, OpenInOtherPane, CopyPath,
         MoveToTrash, NewFolder, NewFile, StartRename, OpenTerminal, QuitApp,
         CopyFile, CutFile, PasteFile, FindInPane, AddPlace, RemovePlace,
         // terminal in the selected folder (right-click on a folder)
@@ -24,7 +24,7 @@ actions!(
         Duplicate, ResetLayout, OpenSettings,
         ToggleColType, ToggleColSize, ToggleColModified, ToggleColPerms,
         // pane-local (handled by the focused Pane)
-        SelectPrev, SelectNext, SelectFirst, SelectLast,
+        SelectPrev, SelectNext, SelectFirst, SelectLast, ExtendPrev, ExtendNext,
         SelectPageUp, SelectPageDown, SelectAll, CloseMenu,
     ]
 );
@@ -39,6 +39,8 @@ pub fn bind_keys(cx: &mut App) {
         // list navigation
         KeyBinding::new("up", SelectPrev, list),
         KeyBinding::new("down", SelectNext, list),
+        KeyBinding::new("shift-up", ExtendPrev, list),
+        KeyBinding::new("shift-down", ExtendNext, list),
         KeyBinding::new("home", SelectFirst, list),
         KeyBinding::new("end", SelectLast, list),
         KeyBinding::new("pageup", SelectPageUp, list),
@@ -75,6 +77,8 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-alt-t", OpenTerminal, app),
         KeyBinding::new("ctrl-l", FocusPath, Some("Workspace")),
         KeyBinding::new("f6", FocusPath, Some("Workspace")),
+        // jump to a folder by typing a few letters of its name
+        KeyBinding::new("ctrl-p", GoToFolder, Some("Workspace")),
         KeyBinding::new("ctrl-q", QuitApp, Some("Workspace")),
         KeyBinding::new("ctrl-,", OpenSettings, app),
     ]);

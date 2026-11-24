@@ -1,4 +1,5 @@
 pub mod button;
+pub mod conflict;
 pub mod context_menu;
 pub mod controls;
 pub mod dnd;

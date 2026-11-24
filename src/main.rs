@@ -4,6 +4,7 @@ mod components;
 mod dbus;
 mod dragout;
 mod filetype;
+mod jump;
 mod foreign;
 mod filter;
 mod menus;
@@ -13,6 +14,7 @@ mod portal;
 mod settings;
 mod settings_view;
 mod theme;
+mod transfer;
 mod uri;
 mod workspace;
 
@@ -88,6 +90,7 @@ fn main() {
     Application::new().run(move |cx: &mut App| {
         settings::init(cx);
         actions::bind_keys(cx);
+        jump::start(); // index folders in the background for the Ctrl+P jump box
 
         if !portal_only {
             let cfg = settings::get();

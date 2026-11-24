@@ -34,6 +34,13 @@ impl LineEdit {
         Self { text, cursor, anchor: 0 }
     }
 
+    /// Replace the text and put the cursor at its end (used to complete a path).
+    pub fn set_text(&mut self, text: String) {
+        self.cursor = text.len();
+        self.anchor = text.len();
+        self.text = text;
+    }
+
     /// For renaming: the name without its extension is selected.
     pub fn for_rename(text: String) -> Self {
         let cursor = match text.rfind('.') {

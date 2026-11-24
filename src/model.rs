@@ -1,7 +1,10 @@
 //! Filesystem model: pure logic, no UI. Easy to unit test and extend
 //! (sorting modes, search, file operations, trash, etc.).
 
-use crate::settings::{self, SizeUnits};
+use crate::{
+    settings::{self, SizeUnits},
+    transfer::{place, unique_dest},
+};
 use std::{
     io,
     sync::{
@@ -456,50 +459,17 @@ pub fn create_file_unique(parent: &Path) -> io::Result<PathBuf> {
     }
 }
 
-/// Internal file clipboard shared by every pane: (path, is_cut).
-static FILE_CLIP: Mutex<Option<(PathBuf, bool)>> = Mutex::new(None);
+/// Internal file clipboard shared by every pane: (paths, is_cut).
+static FILE_CLIP: Mutex<Option<(Vec<PathBuf>, bool)>> = Mutex::new(None);
 
-pub fn set_file_clip(path: PathBuf, cut: bool) {
+pub fn set_file_clip(paths: Vec<PathBuf>, cut: bool) {
     if let Ok(mut c) = FILE_CLIP.lock() {
-        *c = Some((path, cut));
+        *c = Some((paths, cut));
     }
 }
 
-pub fn file_clip() -> Option<(PathBuf, bool)> {
+pub fn file_clip() -> Option<(Vec<PathBuf>, bool)> {
     FILE_CLIP.lock().ok().and_then(|c| c.clone())
-}
-
-/// `dir/name`, or `dir/name copy`, `dir/name copy 2`, ... if taken.
-fn unique_dest(dir: &Path, name: &std::ffi::OsStr) -> PathBuf {
-    let first = dir.join(name);
-    if !first.exists() {
-        return first;
-    }
-    let p = Path::new(name);
-    let stem = p.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-    let ext = p.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
-    let mut n = 1;
-    loop {
-        let label = if n == 1 { " copy".to_string() } else { format!(" copy {n}") };
-        let cand = dir.join(format!("{stem}{label}{ext}"));
-        if !cand.exists() {
-            return cand;
-        }
-        n += 1;
-    }
-}
-
-fn copy_recursive(src: &Path, dst: &Path) -> io::Result<()> {
-    if std::fs::metadata(src)?.is_dir() {
-        std::fs::create_dir(dst)?;
-        for ent in std::fs::read_dir(src)? {
-            let ent = ent?;
-            copy_recursive(&ent.path(), &dst.join(ent.file_name()))?;
-        }
-    } else {
-        std::fs::copy(src, dst)?;
-    }
-    Ok(())
 }
 
 /// Copy or move `src` into `dir`. Returns the new path.
@@ -512,66 +482,23 @@ pub fn paste(src: &Path, cut: bool, dir: &Path) -> io::Result<PathBuf> {
         return Ok(src.to_path_buf()); // moving onto itself: nothing to do
     }
     let dst = unique_dest(dir, name);
-    if cut {
-        if std::fs::rename(src, &dst).is_err() {
-            // different filesystem: copy then delete
-            copy_recursive(src, &dst)?;
-            if std::fs::metadata(src)?.is_dir() {
-                std::fs::remove_dir_all(src)?;
-            } else {
-                std::fs::remove_file(src)?;
-            }
-        }
-    } else {
-        copy_recursive(src, &dst)?;
-    }
+    place(src, &dst, cut)?;
     Ok(dst)
 }
 
 // ---- drag and drop ----------------------------------------------------------
-
-/// Result of a drop: which folders changed (so panes can refresh) and what failed.
-pub struct Transfer {
-    pub touched: Vec<PathBuf>,
-    pub errors: Vec<String>,
-}
-
-/// Copy (`copy`) or move every path in `paths` into the folder `dest`.
-pub fn transfer(paths: &[PathBuf], dest: &Path, copy: bool) -> Transfer {
-    let mut t = Transfer { touched: vec![dest.to_path_buf()], errors: Vec::new() };
-    if !dest.is_dir() {
-        t.errors.push(format!("\"{}\" is not a folder", dest.display()));
-        return t;
-    }
-    for src in paths {
-        if src == dest {
-            continue; // a folder dropped on itself
-        }
-        let name = src.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-        match paste(src, !copy, dest) {
-            Ok(_) => {
-                if !copy {
-                    if let Some(parent) = src.parent() {
-                        t.touched.push(parent.to_path_buf());
-                    }
-                }
-            }
-            Err(e) => t.errors.push(format!("\"{name}\": {e}")),
-        }
-    }
-    t.touched.sort();
-    t.touched.dedup();
-    t
-}
+//
+// Dropping files into a folder is handled by `crate::transfer`, which asks what to
+// do when a name is already taken.
 
 /// gpui can receive drops from other apps but cannot start an OS-level drag
 /// out of the window, so dragging *out* goes through a tiny helper window
 /// that shows the file and acts as the drag source (`ripdrag`, `dragon-drop`).
-pub fn drag_out(path: &Path) -> Result<(), String> {
+pub fn drag_out(paths: &[PathBuf]) -> Result<(), String> {
     for tool in ["ripdrag", "dragon-drop", "dragon", "xdragon"] {
         match Command::new(tool)
             .arg("-x") // close the helper after one successful drop
-            .arg(path)
+            .args(paths)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -668,23 +595,55 @@ fn try_tools(cwd: &Path, tools: &[(&str, Vec<String>)], hint: &str) -> Result<()
 pub fn compress(src: &Path, kind: Archive) -> Result<PathBuf, String> {
     let parent = src.parent().ok_or("bad path")?;
     let name = src.file_name().ok_or("bad path")?.to_string_lossy().into_owned();
-    let s = |x: &str| x.to_string();
+    compress_names(parent, &name, std::slice::from_ref(&name), kind)
+}
+
+/// Compress several items into one archive next to them, named after their folder
+/// ("photos.zip"). One item is the same as `compress`.
+pub fn compress_many(srcs: &[PathBuf], kind: Archive) -> Result<PathBuf, String> {
+    match srcs {
+        [] => Err("nothing to compress".into()),
+        [one] => compress(one, kind),
+        [first, ..] => {
+            let parent = first.parent().ok_or("bad path")?;
+            let mut names = Vec::new();
+            for src in srcs {
+                if src.parent() != Some(parent) {
+                    return Err("the items are in different folders".into());
+                }
+                names.push(src.file_name().ok_or("bad path")?.to_string_lossy().into_owned());
+            }
+            let base = parent
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "Archive".to_string());
+            compress_names(parent, &base, &names, kind)
+        }
+    }
+}
+
+/// Pack `names` (all inside `parent`) into a new archive called `base` + extension.
+fn compress_names(parent: &Path, base: &str, names: &[String], kind: Archive) -> Result<PathBuf, String> {
     let (ext, hint) = match kind {
         Archive::Zip => (".zip", "zip, bsdtar or 7z"),
         Archive::TarGz => (".tar.gz", "tar"),
     };
-    let out_name = free_name(parent, &name, ext);
+    let out_name = free_name(parent, base, ext);
+    // tool arguments: the fixed part, the archive name, then every item
+    let args = |fixed: &[&str]| -> Vec<String> {
+        let mut v: Vec<String> = fixed.iter().map(|x| x.to_string()).collect();
+        v.push(out_name.clone());
+        v.extend(names.iter().cloned());
+        v
+    };
     let tools: Vec<(&str, Vec<String>)> = match kind {
         Archive::Zip => vec![
-            ("zip", vec![s("-r"), s("-q"), out_name.clone(), name.clone()]),
-            ("bsdtar", vec![s("-a"), s("-cf"), out_name.clone(), name.clone()]),
-            ("7z", vec![s("a"), s("-y"), out_name.clone(), name.clone()]),
-            ("7zz", vec![s("a"), s("-y"), out_name.clone(), name.clone()]),
+            ("zip", args(&["-r", "-q"])),
+            ("bsdtar", args(&["-a", "-cf"])),
+            ("7z", args(&["a", "-y"])),
+            ("7zz", args(&["a", "-y"])),
         ],
-        Archive::TarGz => vec![
-            ("tar", vec![s("-czf"), out_name.clone(), name.clone()]),
-            ("bsdtar", vec![s("-czf"), out_name.clone(), name.clone()]),
-        ],
+        Archive::TarGz => vec![("tar", args(&["-czf"])), ("bsdtar", args(&["-czf"]))],
     };
     let out = parent.join(&out_name);
     let res = try_tools(parent, &tools, hint);

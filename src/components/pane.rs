@@ -88,7 +88,9 @@ pub struct Pane {
     picker: bool, // file-chooser mode: opening a file emits `Picked` instead of launching it
     type_filter: Option<Arc<crate::filetype::Filter>>, // file chooser: only matching files are listed
     multi: bool,  // file chooser that allows several files: Ctrl/Shift+click and Ctrl+A mark rows
-    marked: HashSet<PathBuf>, // the marked rows (only used when `multi`)
+    marked: HashSet<PathBuf>, // the marked rows (several selected files and folders)
+    anchor: Option<usize>,    // where Shift+click / Shift+arrows extend the selection from
+    collapse: Option<usize>,  // a press on a marked row: collapse to it on release unless it was a drag
     path_bar: Entity<PathBar>,
     renaming: Option<(usize, LineEdit)>,
     menu: Option<(Point<Pixels>, Entity<ContextMenu>)>,
@@ -151,6 +153,8 @@ impl Pane {
             type_filter: None,
             multi: false,
             marked: HashSet::new(),
+            anchor: None,
+            collapse: None,
             path_bar,
             renaming: None,
             menu: None,
@@ -183,10 +187,16 @@ impl Pane {
         cx.notify();
     }
 
-    /// Let the user mark several files (Ctrl+click toggles, Shift+click marks a
-    /// range, Ctrl+A marks every file in the folder).
+    /// A file chooser that allows several files: turns multi-select on for it.
+    /// (The normal file manager always has it.)
     pub fn set_multi(&mut self) {
         self.multi = true;
+    }
+
+    /// Ctrl+click toggles a row, Shift+click and Shift+arrows mark a range, Ctrl+A marks all.
+    /// A chooser only does this when it was asked for several files.
+    fn allows_multi(&self) -> bool {
+        !self.picker || self.multi
     }
 
     /// The files to hand back: every marked file, in listing order, or the one
@@ -202,14 +212,38 @@ impl Pane {
             .collect()
     }
 
+    /// What the next command (copy, trash, drag, ...) acts on: the marked rows in
+    /// listing order, or just the selected row when nothing is marked.
+    fn targets(&self) -> Vec<Entry> {
+        if !self.marked.is_empty() {
+            let marked: Vec<Entry> =
+                self.entries.iter().filter(|e| self.marked.contains(&e.path)).cloned().collect();
+            if !marked.is_empty() {
+                return marked;
+            }
+        }
+        self.selected.and_then(|i| self.entries.get(i)).cloned().into_iter().collect()
+    }
+
+    fn target_paths(&self) -> Vec<PathBuf> {
+        self.targets().into_iter().map(|e| e.path).collect()
+    }
+
+    /// Mark the rows from `a` to `b` (either order), replacing the old marks.
+    fn mark_range(&mut self, a: usize, b: usize) {
+        let (lo, hi) = (a.min(b), a.max(b));
+        let hi = hi.min(self.entries.len().saturating_sub(1));
+        self.marked = self.entries.get(lo..=hi).unwrap_or(&[]).iter().map(|e| e.path.clone()).collect();
+    }
+
     /// Ctrl/Shift+click on row `index`.
     fn mark_click(&mut self, index: usize, range: bool, cx: &mut Context<Self>) {
         let Some(entry) = self.entries.get(index) else { return };
         if range {
-            // from the last plain-clicked row (the anchor, `selected`) to this one
-            let anchor = self.selected.unwrap_or(index);
-            let (lo, hi) = (anchor.min(index), anchor.max(index));
-            self.marked = self.entries[lo..=hi].iter().map(|e| e.path.clone()).collect();
+            // from the last plain-clicked row (the anchor) to this one
+            let anchor = self.anchor.or(self.selected).unwrap_or(index);
+            self.mark_range(anchor, index);
+            self.anchor = Some(anchor);
         } else {
             let path = entry.path.clone();
             if self.marked.is_empty() {
@@ -221,18 +255,49 @@ impl Pane {
             if !self.marked.remove(&path) {
                 self.marked.insert(path);
             }
-            self.selected = Some(index);
+            self.anchor = Some(index);
         }
+        self.selected = Some(index);
         cx.emit(PaneEvent::Changed);
         cx.notify();
     }
 
-    /// Ctrl+A in a multi-select chooser.
-    pub fn select_all(&mut self, cx: &mut Context<Self>) {
-        if !self.multi {
+    /// Shift+Up / Shift+Down: grow or shrink the marked range from the anchor.
+    fn extend_selection(&mut self, delta: isize, cx: &mut Context<Self>) {
+        if !self.allows_multi() {
+            self.move_selection(delta, cx);
             return;
         }
-        self.marked = self.entries.iter().filter(|e| !e.is_dir).map(|e| e.path.clone()).collect();
+        let len = self.entries.len();
+        if len == 0 {
+            return;
+        }
+        let Some(cursor) = self.selected else {
+            self.select(if delta > 0 { 0 } else { len - 1 }, cx);
+            return;
+        };
+        let anchor = self.anchor.unwrap_or(cursor);
+        let next = (cursor as isize + delta).clamp(0, len as isize - 1) as usize;
+        self.mark_range(anchor, next);
+        self.anchor = Some(anchor);
+        self.selected = Some(next);
+        self.scroll_nearest(next);
+        cx.emit(PaneEvent::Changed);
+        cx.notify();
+    }
+
+    /// Ctrl+A. A file chooser only marks files.
+    pub fn select_all(&mut self, cx: &mut Context<Self>) {
+        if !self.allows_multi() {
+            return;
+        }
+        let files_only = self.picker;
+        self.marked =
+            self.entries.iter().filter(|e| !files_only || !e.is_dir).map(|e| e.path.clone()).collect();
+        if self.selected.is_none() && !self.entries.is_empty() {
+            self.selected = Some(0);
+            self.anchor = Some(0);
+        }
         cx.emit(PaneEvent::Changed);
         cx.notify();
     }
@@ -260,7 +325,14 @@ impl Pane {
         } else {
             format!("{} items", self.entries.len())
         };
-        if let Some(e) = self.selected.and_then(|i| self.entries.get(i)) {
+        let marked: Vec<&Entry> = self.entries.iter().filter(|e| self.marked.contains(&e.path)).collect();
+        if marked.len() > 1 {
+            let bytes: u64 = marked.iter().filter(|e| !e.is_dir).map(|e| e.size).sum();
+            s.push_str(&format!("  |  {} selected", marked.len()));
+            if bytes > 0 {
+                s.push_str(&format!("  ({})", model::format_size(bytes)));
+            }
+        } else if let Some(e) = self.selected.and_then(|i| self.entries.get(i)) {
             s.push_str(&format!("  |  {}", e.name));
             if !e.is_dir {
                 s.push_str(&format!("  ({})", model::format_size(e.size)));
@@ -333,22 +405,52 @@ impl Pane {
         self.toggle_col(4, cx);
     }
 
-    /// Copy the selected file or folder next to itself ("name copy").
+    /// Copy the selected files and folders next to themselves ("name copy").
     pub fn duplicate(&mut self, cx: &mut Context<Self>) {
-        let Some(e) = self.selected.and_then(|i| self.entries.get(i)).cloned() else { return };
-        let dir = e.path.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| self.path.clone());
-        match model::paste(&e.path, false, &dir) {
-            Ok(dst) => {
-                if dst.parent() == Some(self.path.as_path()) {
-                    self.add_entry(&dst);
+        let sources = self.target_paths();
+        if sources.is_empty() {
+            return;
+        }
+        let mut made: Vec<PathBuf> = Vec::new();
+        let mut failure: Option<String> = None;
+        for src in &sources {
+            let dir = src.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| self.path.clone());
+            match model::paste(src, false, &dir) {
+                Ok(dst) => {
+                    if dst.parent() == Some(self.path.as_path()) {
+                        self.add_entry(&dst);
+                    }
+                    made.push(dst);
                 }
-                match self.entries.iter().position(|x| x.path == dst) {
-                    Some(i) => self.select(i, cx),
-                    None => cx.notify(),
+                Err(err) => {
+                    failure.get_or_insert(format!("Duplicate failed: {err}"));
                 }
             }
-            Err(err) => {
-                self.error = Some(format!("Duplicate failed: {err}").into());
+        }
+        self.select_new(&made, cx);
+        if let Some(msg) = failure {
+            self.error = Some(msg.into());
+            cx.notify();
+        }
+    }
+
+    /// Select the files that were just created in this folder (one: selected; several: marked).
+    fn select_new(&mut self, created: &[PathBuf], cx: &mut Context<Self>) {
+        let rows: Vec<usize> =
+            created.iter().filter_map(|p| self.entries.iter().position(|e| e.path == *p)).collect();
+        match rows.as_slice() {
+            [] => {
+                cx.emit(PaneEvent::Changed);
+                cx.notify();
+            }
+            [one] => self.select(*one, cx),
+            many => {
+                let last = *many.last().unwrap_or(&0);
+                self.marked = many.iter().filter_map(|&i| self.entries.get(i)).map(|e| e.path.clone()).collect();
+                self.selected = Some(last);
+                self.anchor = Some(many[0]);
+                self.scroll_nearest(last);
+                cx.emit(PaneEvent::Changed);
                 cx.notify();
             }
         }
@@ -383,12 +485,15 @@ impl Pane {
         cx.emit(PaneEvent::Dropped { paths, dest, copy });
     }
 
-    /// Hand the selected file to a drag-source helper window so it can be
+    /// Hand the selected files to a drag-source helper window so they can be
     /// dragged into other applications.
     pub fn drag_out(&mut self, cx: &mut Context<Self>) {
-        let Some(path) = self.selected_path() else { return };
+        let paths = self.target_paths();
+        if paths.is_empty() {
+            return;
+        }
         cx.spawn(async move |this, cx| {
-            let result = cx.background_executor().spawn(async move { model::drag_out(&path) }).await;
+            let result = cx.background_executor().spawn(async move { model::drag_out(&paths) }).await;
             if let Err(msg) = result {
                 this.update(cx, |pane, cx| {
                     pane.error = Some(format!("Drag out failed: {msg}").into());
@@ -403,17 +508,34 @@ impl Pane {
     // ---- compress / extract ----------------------------------------------
 
     pub fn compress_selected(&mut self, kind: Archive, cx: &mut Context<Self>) {
-        let Some(src) = self.selected_path() else { return };
-        self.run_job("Compressing", move || model::compress(&src, kind), cx);
+        let sources = self.target_paths();
+        if sources.is_empty() {
+            return;
+        }
+        self.run_job("Compressing", move || model::compress_many(&sources, kind), cx);
     }
 
     pub fn extract_selected(&mut self, cx: &mut Context<Self>) {
-        let Some(e) = self.selected.and_then(|i| self.entries.get(i)) else { return };
-        if e.is_dir || !model::is_archive(&e.name) {
+        let archives: Vec<PathBuf> = self
+            .targets()
+            .into_iter()
+            .filter(|e| !e.is_dir && model::is_archive(&e.name))
+            .map(|e| e.path)
+            .collect();
+        if archives.is_empty() {
             return;
         }
-        let src = e.path.clone();
-        self.run_job("Extracting", move || model::extract(&src), cx);
+        self.run_job(
+            "Extracting",
+            move || {
+                let mut last = None;
+                for archive in &archives {
+                    last = Some(model::extract(archive)?);
+                }
+                last.ok_or_else(|| "nothing to extract".to_string())
+            },
+            cx,
+        );
     }
 
     /// Run a blocking archive job off the UI thread; on success the new file or
@@ -455,6 +577,7 @@ impl Pane {
             return;
         }
         self.filter = None;
+        crate::jump::visit(&path); // the jump box lists the folders you use most first
         let old = std::mem::replace(&mut self.path, path);
         self.back.push(old);
         self.forward.clear();
@@ -534,6 +657,11 @@ impl Pane {
         self.path_bar.update(cx, |bar, cx| bar.start_edit(window, cx));
     }
 
+    /// Ctrl+P: the "Go to folder" box, focused and empty.
+    pub fn start_jump(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.path_bar.update(cx, |bar, cx| bar.start_jump(window, cx));
+    }
+
     // ---- selection -----------------------------------------------------
 
     /// Scroll just enough to bring row `index` into view (no jump if visible).
@@ -557,6 +685,7 @@ impl Pane {
     fn select(&mut self, index: usize, cx: &mut Context<Self>) {
         self.marked.clear(); // a plain click or arrow key ends a multi-selection
         self.selected = Some(index);
+        self.anchor = Some(index);
         self.scroll_nearest(index);
         cx.emit(PaneEvent::Changed);
         cx.notify();
@@ -579,6 +708,17 @@ impl Pane {
     // ---- file operations -------------------------------------------------
 
     pub fn open_selected(&mut self, cx: &mut Context<Self>) {
+        // several marked files: open them all (a chooser reports the selection instead)
+        if !self.picker && self.marked.len() > 1 {
+            let files: Vec<PathBuf> =
+                self.targets().into_iter().filter(|e| !e.is_dir).map(|e| e.path).collect();
+            if !files.is_empty() {
+                for file in &files {
+                    model::open_external(file);
+                }
+                return;
+            }
+        }
         if let Some(i) = self.selected {
             self.open_index(i, cx);
         }
@@ -596,27 +736,46 @@ impl Pane {
     }
 
     pub fn copy_path(&mut self, cx: &mut Context<Self>) {
-        let path = self
-            .selected
-            .and_then(|i| self.entries.get(i))
-            .map(|e| e.path.clone())
-            .unwrap_or_else(|| self.path.clone());
-        cx.write_to_clipboard(ClipboardItem::new_string(path.to_string_lossy().into_owned()));
+        let paths = self.target_paths();
+        let text = if paths.is_empty() {
+            self.path.to_string_lossy().into_owned()
+        } else {
+            paths.iter().map(|p| p.to_string_lossy()).collect::<Vec<_>>().join("\n")
+        };
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
     }
 
     pub fn trash_selected(&mut self, cx: &mut Context<Self>) {
-        let Some(index) = self.selected else { return };
-        let Some(entry) = self.entries.get(index).cloned() else { return };
-        match model::trash(&entry.path) {
-            Ok(()) => {
-                self.all.retain(|e| e.path != entry.path);
-                self.apply_view();
-                self.selected = (!self.entries.is_empty()).then(|| index.min(self.entries.len() - 1));
-                cx.emit(PaneEvent::Changed);
+        let targets = self.targets();
+        let Some(first) = targets.first() else { return };
+        let first_row = self.entries.iter().position(|e| e.path == first.path).unwrap_or(0);
+        let mut trashed: HashSet<PathBuf> = HashSet::new();
+        let mut failed = 0;
+        let mut message: Option<String> = None;
+        for entry in &targets {
+            match model::trash(&entry.path) {
+                Ok(()) => {
+                    trashed.insert(entry.path.clone());
+                }
+                Err(err) => {
+                    failed += 1;
+                    message.get_or_insert(format!("Couldn't trash \"{}\": {err}", entry.name));
+                }
             }
-            Err(err) => {
-                self.error = Some(format!("Couldn't trash \"{}\": {err}", entry.name).into());
+        }
+        if !trashed.is_empty() {
+            self.all.retain(|e| !trashed.contains(&e.path));
+            self.marked.clear();
+            self.apply_view();
+            self.selected = (!self.entries.is_empty()).then(|| first_row.min(self.entries.len() - 1));
+            self.anchor = self.selected;
+            cx.emit(PaneEvent::Changed);
+        }
+        if let Some(mut msg) = message {
+            if failed > 1 {
+                msg.push_str(&format!(" (and {} more)", failed - 1));
             }
+            self.error = Some(msg.into());
         }
         cx.notify();
     }
@@ -687,16 +846,17 @@ impl Pane {
     }
 
     pub fn copy_file(&mut self, cx: &mut Context<Self>) {
-        if let Some(e) = self.selected.and_then(|i| self.entries.get(i)) {
-            model::set_file_clip(e.path.clone(), false);
-            self.error = None;
-            cx.notify();
-        }
+        self.set_clip(false, cx);
     }
 
     pub fn cut_file(&mut self, cx: &mut Context<Self>) {
-        if let Some(e) = self.selected.and_then(|i| self.entries.get(i)) {
-            model::set_file_clip(e.path.clone(), true);
+        self.set_clip(true, cx);
+    }
+
+    fn set_clip(&mut self, cut: bool, cx: &mut Context<Self>) {
+        let paths = self.target_paths();
+        if !paths.is_empty() {
+            model::set_file_clip(paths, cut);
             self.error = None;
             cx.notify();
         }
@@ -704,33 +864,40 @@ impl Pane {
 
     /// Paste into the selected folder if one is selected, else the current folder.
     pub fn paste_file(&mut self, cx: &mut Context<Self>) {
-        let Some((src, cut)) = model::file_clip() else { return };
-        let dir = self.selected_dir().unwrap_or_else(|| self.path.clone());
-        match model::paste(&src, cut, &dir) {
-            Ok(dst) => {
-                if cut {
-                    // the source is gone; don't offer to paste it again
-                    model::set_file_clip(dst.clone(), false);
+        let Some((sources, cut)) = model::file_clip() else { return };
+        // with several rows marked, "the selected folder" is ambiguous: paste here
+        let dir = if self.marked.is_empty() {
+            self.selected_dir().unwrap_or_else(|| self.path.clone())
+        } else {
+            self.path.clone()
+        };
+        let mut pasted: Vec<PathBuf> = Vec::new();
+        let mut failure: Option<String> = None;
+        for src in &sources {
+            match model::paste(src, cut, &dir) {
+                Ok(dst) => {
+                    if cut {
+                        self.all.retain(|e| e.path != *src); // the source is gone
+                    }
+                    if dst.parent() == Some(self.path.as_path()) {
+                        self.add_entry(&dst);
+                    }
+                    pasted.push(dst);
                 }
-                if cut {
-                    self.all.retain(|e| e.path != src);
-                }
-                if dst.parent() == Some(self.path.as_path()) {
-                    self.add_entry(&dst);
-                } else {
-                    self.apply_view();
-                }
-                if let Some(i) = self.entries.iter().position(|e| e.path == dst) {
-                    self.select(i, cx);
-                } else {
-                    cx.emit(PaneEvent::Changed);
-                    cx.notify();
+                Err(err) => {
+                    failure.get_or_insert(format!("Paste failed: {err}"));
                 }
             }
-            Err(err) => {
-                self.error = Some(format!("Paste failed: {err}").into());
-                cx.notify();
-            }
+        }
+        if cut && !pasted.is_empty() {
+            // don't offer to paste the moved files again; they live at their new place now
+            model::set_file_clip(pasted.clone(), false);
+        }
+        self.apply_view();
+        self.select_new(&pasted, cx);
+        if let Some(msg) = failure {
+            self.error = Some(msg.into());
+            cx.notify();
         }
     }
 
@@ -850,6 +1017,7 @@ impl Pane {
     pub fn start_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(index) = self.selected else { return };
         let Some(name) = self.entries.get(index).map(|e| e.name.clone()) else { return };
+        self.marked.clear(); // renaming is for one item
         self.menu = None;
         self.renaming = Some((index, LineEdit::for_rename(name)));
         window.focus(&self.rename_focus);
@@ -922,8 +1090,17 @@ impl Pane {
     ) {
         window.focus(&self.focus);
         self.renaming = None;
+        // right-click on one of several marked rows keeps them all; anywhere else selects that row
+        let on_marked = row
+            .and_then(|i| self.entries.get(i))
+            .is_some_and(|e| self.marked.len() > 1 && self.marked.contains(&e.path));
+        if !on_marked {
+            self.marked.clear();
+            self.anchor = row;
+        }
         self.selected = row;
         let entries = match row.and_then(|i| self.entries.get(i)) {
+            Some(_) if on_marked => menus::multi_menu(),
             Some(e) => menus::row_menu(e.is_dir, !e.is_dir && model::is_archive(&e.name)),
             None => menus::background_menu(self.show_hidden),
         };
@@ -1062,11 +1239,18 @@ impl Pane {
         let underline = cfg.underline_names;
         let mono = cfg.mono_family.clone();
         let row_h = cfg.row_height as f32;
+        let marked_drag: Option<Vec<PathBuf>> = (self.marked.len() > 1).then(|| {
+            self.entries.iter().filter(|e| self.marked.contains(&e.path)).map(|e| e.path.clone()).collect()
+        });
         range
             .filter_map(|i| {
                 let e = self.entries.get(i)?;
                 let row = {
-                let selected = self.selected == Some(i) || self.marked.contains(&e.path);
+                let selected = if self.marked.is_empty() {
+                    self.selected == Some(i)
+                } else {
+                    self.marked.contains(&e.path)
+                };
                 let size = if e.is_dir { String::new() } else { model::format_size(e.size) };
 
                 let name_el: AnyElement = match &self.renaming {
@@ -1100,7 +1284,14 @@ impl Pane {
                         .into_any_element(),
                 };
 
-                let drag = FileDrag::single(e.path.clone(), &e.name);
+                // dragging one of several marked rows carries all of them
+                let drag = match &marked_drag {
+                    Some(paths) if self.marked.contains(&e.path) => FileDrag {
+                        paths: paths.clone(),
+                        label: format!("{} items", paths.len()).into(),
+                    },
+                    _ => FileDrag::single(e.path.clone(), &e.name),
+                };
                 let drop_dir = e.path.clone();
                 let is_dir = e.is_dir;
 
@@ -1205,9 +1396,22 @@ impl Pane {
                             this.menu = None;
                             window.focus(&this.focus);
                             cx.emit(PaneEvent::Activated);
-                            // multi-select chooser: Ctrl+click toggles, Shift+click marks a range
-                            if this.multi && (ev.modifiers.control || ev.modifiers.shift) {
+                            this.collapse = None;
+                            // Ctrl+click toggles a row, Shift+click marks a range
+                            if this.allows_multi() && (ev.modifiers.control || ev.modifiers.shift) {
                                 this.mark_click(i, ev.modifiers.shift, cx);
+                                return;
+                            }
+                            // pressing a row that is one of several marked keeps them (so all can
+                            // be dragged); a click without a drag narrows to this row on release
+                            if this.allows_multi()
+                                && ev.click_count == 1
+                                && this.marked.len() > 1
+                                && this.entries.get(i).is_some_and(|e| this.marked.contains(&e.path))
+                            {
+                                this.collapse = Some(i);
+                                this.selected = Some(i);
+                                cx.notify();
                                 return;
                             }
                             // double-click mode opens here. Single-click mode opens on
@@ -1225,10 +1429,14 @@ impl Pane {
                     .on_mouse_up(
                         MouseButton::Left,
                         cx.listener(move |this, ev: &MouseUpEvent, _, cx| {
+                            if this.collapse.take() == Some(i) && !cx.has_active_drag() {
+                                this.select(i, cx);
+                                return;
+                            }
                             // first click of a single-click open, on the row that was
                             // pressed, and not the end of a drag
                             if single_click
-                                && !(this.multi && (ev.modifiers.control || ev.modifiers.shift))
+                                && !(this.allows_multi() && (ev.modifiers.control || ev.modifiers.shift))
                                 && ev.click_count == 1
                                 && this.selected == Some(i)
                                 && this.renaming.is_none()
@@ -1311,6 +1519,8 @@ impl Render for Pane {
             // list navigation (pane-local actions)
             .on_action(cx.listener(|this, _: &SelectPrev, _, cx| this.move_selection(-1, cx)))
             .on_action(cx.listener(|this, _: &SelectNext, _, cx| this.move_selection(1, cx)))
+            .on_action(cx.listener(|this, _: &ExtendPrev, _, cx| this.extend_selection(-1, cx)))
+            .on_action(cx.listener(|this, _: &ExtendNext, _, cx| this.extend_selection(1, cx)))
             .on_action(cx.listener(|this, _: &SelectPageUp, _, cx| this.move_selection(-10, cx)))
             .on_action(cx.listener(|this, _: &SelectPageDown, _, cx| this.move_selection(10, cx)))
             .on_action(cx.listener(|this, _: &SelectFirst, _, cx| {
@@ -1327,6 +1537,10 @@ impl Render for Pane {
             }))
             .on_action(cx.listener(|this, _: &CloseMenu, _, cx| {
                 if this.menu.take().is_some() {
+                    cx.notify();
+                } else if !this.picker && !this.marked.is_empty() {
+                    this.marked.clear();
+                    cx.emit(PaneEvent::Changed);
                     cx.notify();
                 } else if this.filter.is_some() {
                     this.filter = None;

@@ -4,6 +4,7 @@
 use crate::{
     actions::*,
     components::{
+        conflict::{ConflictDialog, ConflictEvent},
         dnd::FileDrag,
         menubar::MenuBar,
         pane::{Pane, PaneEvent},
@@ -16,6 +17,7 @@ use crate::{
     dragout, model,
     settings::{self, Settings, SettingsChanged},
     theme,
+    transfer::{Progress, Transfer, TransferJob},
 };
 use gpui::{prelude::*, *};
 use std::{path::PathBuf, sync::Arc};
@@ -40,6 +42,11 @@ pub struct Workspace {
     /// Started by D-Bus activation: the first request from another app takes
     /// over the lone default pane instead of opening a second one.
     adopt_first_request: bool,
+    /// A drop that hit a name clash: paused until the dialog below is answered.
+    job: Option<TransferJob>,
+    dialog: Option<(Entity<ConflictDialog>, Subscription)>,
+    /// Give the dialog keyboard focus on the next render.
+    focus_dialog: bool,
 }
 
 /// Run a no-window method on the active pane when `$action` fires.
@@ -79,6 +86,9 @@ impl Workspace {
             refocus: false,
             prev: settings::get(),
             adopt_first_request: dbus_activated,
+            job: None,
+            dialog: None,
+            focus_dialog: false,
         };
         for path in paths {
             let pane = this.new_pane(path, cx);
@@ -305,10 +315,56 @@ fn on_pane(&mut self, pane: Entity<Pane>, event: &PaneEvent, cx: &mut Context<Se
     }
 
     /// Copy or move `paths` into `dest` (a drop from another split, from the
-    /// sidebar, or from another application), then bring every pane that
-    /// shows an affected folder up to date.
+    /// sidebar, or from another application). When a dropped item has the name
+    /// of something already in `dest`, the work pauses and the user is asked
+    /// (rename / merge / replace / skip); see `on_conflict`.
     fn transfer(&mut self, paths: Vec<PathBuf>, dest: PathBuf, copy: bool, cx: &mut Context<Self>) {
-        let result = model::transfer(&paths, &dest, copy);
+        if self.job.is_some() {
+            return; // the previous drop is still waiting for an answer
+        }
+        let mut job = TransferJob::new(paths, dest, copy);
+        let step = job.run();
+        self.drive(job, step, cx);
+    }
+
+    /// Either open the dialog for the clash the job stopped at, or wrap up.
+    fn drive(&mut self, job: TransferJob, step: Progress, cx: &mut Context<Self>) {
+        match step {
+            Progress::Conflict(conflict) => {
+                let dialog = cx.new(|cx| ConflictDialog::new(conflict, cx));
+                let sub = cx.subscribe(&dialog, Self::on_conflict);
+                self.dialog = Some((dialog, sub));
+                self.job = Some(job);
+                self.focus_dialog = true;
+            }
+            Progress::Done(result) => self.finish_transfer(result, cx),
+        }
+        cx.notify();
+    }
+
+    /// The user answered the dialog: carry on with the paused drop.
+    fn on_conflict(&mut self, _: Entity<ConflictDialog>, event: &ConflictEvent, cx: &mut Context<Self>) {
+        self.dialog = None;
+        self.refocus = true; // keyboard focus goes back to the pane
+        let Some(mut job) = self.job.take() else {
+            cx.notify();
+            return;
+        };
+        match event {
+            ConflictEvent::Resolved { choice, apply_to_all } => {
+                let step = job.resolve(*choice, *apply_to_all);
+                self.drive(job, step, cx);
+            }
+            ConflictEvent::Cancelled => {
+                let result = job.cancel();
+                self.finish_transfer(result, cx);
+                cx.notify();
+            }
+        }
+    }
+
+    /// Bring every pane that shows an affected folder up to date and report failures.
+    fn finish_transfer(&mut self, result: Transfer, cx: &mut Context<Self>) {
         for pane in &self.panes {
             pane.update(cx, |p, cx| p.refresh_if_showing(&result.touched, cx));
         }
@@ -318,7 +374,7 @@ fn on_pane(&mut self, pane: Entity<Pane>, event: &PaneEvent, cx: &mut Context<Se
             let target = self
                 .panes
                 .iter()
-                .find(|p| p.read(cx).path() == dest.as_path())
+                .find(|p| p.read(cx).path() == result.dest.as_path())
                 .cloned()
                 .unwrap_or_else(|| self.active_pane());
             let msg = format!("Drop failed: {}", result.errors.join("; "));
@@ -332,6 +388,12 @@ impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if std::mem::take(&mut self.refocus) {
             self.focus_active(window, cx);
+        }
+        if std::mem::take(&mut self.focus_dialog) {
+            if let Some((dialog, _)) = &self.dialog {
+                let handle = dialog.focus_handle(cx);
+                window.focus(&handle);
+            }
         }
 
         // Settings > Appearance > Font size: rem-based sizes (text-xs, spacing) scale with it
@@ -487,6 +549,10 @@ impl Render for Workspace {
                 let pane = this.active_pane();
                 pane.update(cx, |p, cx| p.start_path_edit(window, cx));
             }))
+            .on_action(cx.listener(|this, _: &GoToFolder, window, cx| {
+                let pane = this.active_pane();
+                pane.update(cx, |p, cx| p.start_jump(window, cx));
+            }))
             .on_action(cx.listener(|_, _: &QuitApp, _, cx| cx.quit()))
             .on_action(cx.listener(|_, _: &OpenSettings, _, cx| crate::settings_view::open(cx)))
             // layout
@@ -521,5 +587,7 @@ impl Render for Workspace {
                     ),
             )
             .children(cfg.show_statusbar.then(|| self.status.clone()))
+            // last child = painted on top of everything: the "already exists" dialog
+            .children(self.dialog.as_ref().map(|(dialog, _)| dialog.clone()))
     }
 }

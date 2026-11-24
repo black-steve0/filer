@@ -49,9 +49,19 @@ pub fn open(cx: &mut App) {
                 title: Some("Settings".into()),
                 ..Default::default()
             }),
+            // its own app id, so a compositor rule can float it; and never smaller than
+            // what the page list and a row of controls need
+            app_id: Some("filer-settings".into()),
+            window_min_size: Some(size(px(560.), px(380.))),
             ..Default::default()
         },
-        |_, cx| cx.new(|cx| SettingsView::new(cx)),
+        |window, cx| {
+            let view = cx.new(|cx| SettingsView::new(cx));
+            // keyboard focus starts in the window, so Esc works without a click first
+            let focus = view.read(cx).root_focus.clone();
+            window.focus(&focus);
+            view
+        },
     );
     if let Ok(handle) = opened {
         cx.set_global(SettingsWindow(handle));
@@ -110,15 +120,20 @@ impl Field {
 }
 
 /// Keys that work in the file list but are not in any menu.
-const LIST_KEYS: [(&str, &str); 8] = [
+const LIST_KEYS: [(&str, &str); 13] = [
     ("Up / Down", "Move the selection"),
+    ("Shift+Up / Shift+Down", "Select several items in a row"),
+    ("Ctrl+click / Shift+click", "Add or remove one item / select a range"),
+    ("Ctrl+A", "Select everything in the folder"),
     ("Home / End", "First / last item"),
     ("PageUp / PageDown", "Move 10 items"),
-    ("Esc", "Close a menu or the filter"),
+    ("Esc", "Clear the selection, close a menu or the filter"),
     ("Ctrl+R", "Refresh (same as F5)"),
     ("F6", "Edit the location (same as Ctrl+L)"),
-    ("Alt+C  (in the filter)", "Match case on / off"),
-    ("Alt+T  (in the filter)", "Cycle All / Folders / Files"),
+    ("Ctrl+P  (then type)", "Go to a folder: Enter goes to the top match"),
+    ("Up / Down  (in Go to)", "Choose one of the 5 matching folders"),
+    ("Tab  (in Go to)", "Complete the chosen folder and keep typing"),
+    ("Alt+C / Alt+T  (in the filter)", "Match case on / off, cycle All / Folders / Files"),
 ];
 
 pub struct SettingsView {
@@ -675,6 +690,13 @@ impl Render for SettingsView {
             .id("settings-root")
             .key_context("Settings")
             .track_focus(&self.root_focus)
+            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, _| {
+                let key = ev.keystroke.key.as_str();
+                let ctrl = ev.keystroke.modifiers.control;
+                if this.editing.is_none() && (key == "escape" || (ctrl && key == "w")) {
+                    window.remove_window();
+                }
+            }))
             // a click on anything that isn't a field takes the focus, which ends an edit
             .on_mouse_down(
                 MouseButton::Left,
