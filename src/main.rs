@@ -1,5 +1,6 @@
 mod actions;
 mod activation;
+mod apps;
 mod components;
 mod dbus;
 mod dragout;
@@ -11,6 +12,7 @@ mod menus;
 mod model;
 mod picker;
 mod portal;
+mod props;
 mod settings;
 mod settings_view;
 mod theme;

@@ -8,7 +8,10 @@
 //! running `TransferJob`, which does the actual work.
 
 use crate::{
-    components::controls::{checkbox, chip},
+    components::{
+        controls::chip,
+        modal::{check_row, frame},
+    },
     model, theme,
     transfer::{Choice, Conflict, ConflictKind},
 };
@@ -128,125 +131,62 @@ impl Render for ConflictDialog {
             )
         });
 
-        let panel = div()
-            .flex()
-            .flex_col()
-            .w(px(460.))
-            .max_w_full()
-            .bg(rgb(theme::MANTLE))
-            .border_1()
-            .border_color(rgb(0x000000))
-            .shadow(theme::raised())
-            .text_color(rgb(theme::TEXT))
-            .child(
-                div()
-                    .px_2()
-                    .py_0p5()
-                    .bg(rgb(theme::TITLE_ACTIVE))
-                    .text_color(rgb(0xffffff))
-                    .font_weight(FontWeight::BOLD)
-                    .child(title),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .p_3()
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .child(
-                                div()
-                                    .truncate()
-                                    .font_weight(FontWeight::BOLD)
-                                    .child(format!("\u{201c}{name}\u{201d}")),
-                            )
-                            .child(div().child(format!("{noun} with this name already exists in")))
-                            .child(div().truncate().text_color(rgb(theme::SUBTEXT)).child(folder)),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .p_2()
-                            .bg(rgb(theme::BG))
-                            .shadow(theme::sunken())
-                            .border_1()
-                            .border_color(rgb(theme::SURFACE0))
-                            .child(detail("Existing", self.existing.clone()))
-                            .child(detail("Dropped", self.incoming.clone())),
-                    )
-                    .child(div().text_xs().text_color(rgb(theme::SUBTEXT)).child(hint))
-                    // the check box and its label are two separate hit areas, so one click never toggles twice
-                    .child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap_2()
-                            .child(checkbox(
-                                "conflict-all",
-                                self.apply_to_all,
-                                cx.listener(|this, _: &MouseDownEvent, _, cx| {
-                                    this.toggle_all(cx);
-                                    cx.stop_propagation();
-                                }),
-                            ))
-                            .child(
-                                div()
-                                    .cursor_pointer()
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _, _, cx| {
-                                            this.toggle_all(cx);
-                                            cx.stop_propagation();
-                                        }),
-                                    )
-                                    .child("Apply to all items"),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .justify_between()
-                            .mt_1()
-                            .child(div().flex().flex_row().gap_1().children(choices))
-                            .child(chip(
-                                ("conflict-cancel", 0usize),
-                                "Cancel",
-                                false,
-                                cx.listener(|_, _: &MouseDownEvent, _, cx| {
-                                    cx.emit(ConflictEvent::Cancelled);
-                                    cx.stop_propagation();
-                                }),
-                            )),
-                    ),
-            );
+        let rows = vec![
+            div()
+                .flex()
+                .flex_col()
+                .child(
+                    div()
+                        .truncate()
+                        .font_weight(FontWeight::BOLD)
+                        .child(format!("\u{201c}{name}\u{201d}")),
+                )
+                .child(div().child(format!("{noun} with this name already exists in")))
+                .child(div().truncate().text_color(rgb(theme::SUBTEXT)).child(folder))
+                .into_any_element(),
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .p_2()
+                .bg(rgb(theme::BG))
+                .shadow(theme::sunken())
+                .border_1()
+                .border_color(rgb(theme::SURFACE0))
+                .child(detail("Existing", self.existing.clone()))
+                .child(detail("Dropped", self.incoming.clone()))
+                .into_any_element(),
+            div().text_xs().text_color(rgb(theme::SUBTEXT)).child(hint).into_any_element(),
+            check_row(
+                "conflict-all",
+                "Apply to all items",
+                self.apply_to_all,
+                cx.listener(|this, _: &MouseDownEvent, _, cx| this.toggle_all(cx)),
+            ),
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .mt_1()
+                .child(div().flex().flex_row().gap_1().children(choices))
+                .child(chip(
+                    ("conflict-cancel", 0usize),
+                    "Cancel",
+                    false,
+                    cx.listener(|_, _: &MouseDownEvent, _, cx| {
+                        cx.emit(ConflictEvent::Cancelled);
+                        cx.stop_propagation();
+                    }),
+                ))
+                .into_any_element(),
+        ];
 
-        // Covers the whole window and swallows the mouse, so the panes behind can't be used
-        // while a decision is pending. "TextInput" switches the pane/app shortcuts off, the
-        // same way it does while a text field is focused.
-        div()
-            .absolute()
-            .top_0()
-            .left_0()
-            .size_full()
-            .occlude()
-            .flex()
-            .items_center()
-            .justify_center()
-            .bg(theme::alpha(0x000000, 0x66))
-            .key_context("TextInput")
+        frame(title, 460., rows)
             .track_focus(&self.focus)
             .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _, cx| {
                 this.key(ev, cx);
                 cx.stop_propagation();
             }))
-            .child(panel)
     }
 }

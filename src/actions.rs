@@ -11,6 +11,8 @@ actions!(
         SwitchPane, FocusPath, GoToFolder, OpenSelected, OpenInOtherPane, CopyPath,
         MoveToTrash, NewFolder, NewFile, StartRename, OpenTerminal, QuitApp,
         CopyFile, CutFile, PasteFile, FindInPane, AddPlace, RemovePlace,
+        // "Open With..." dialog / Properties dialog
+        OpenWith, ShowProperties,
         // terminal in the selected folder (right-click on a folder)
         OpenTerminalInSelected,
         // hand the selected file to a small drag-source window (drag out of the app)
@@ -52,6 +54,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("backspace", GoUp, list),
         KeyBinding::new("delete", MoveToTrash, list),
         KeyBinding::new("f2", StartRename, list),
+        KeyBinding::new("alt-enter", ShowProperties, list),
         KeyBinding::new("ctrl-d", Duplicate, list),
         KeyBinding::new("ctrl-shift-d", DragOut, list),
         KeyBinding::new("tab", SwitchPane, list),

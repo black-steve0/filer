@@ -6,7 +6,7 @@
 //!
 //!   ShowFolders(as uris, s startup_id)         open these folders
 //!   ShowItems(as uris, s startup_id)           open the parent folder, select the item
-//!   ShowItemProperties(as uris, s startup_id)  properties dialog (we just reveal the item)
+//!   ShowItemProperties(as uris, s startup_id)  open the properties dialog
 //!
 //! This module owns the bus name on its own thread and turns each call into a
 //! `Request` on a channel. `main` drains the channel on gpui's thread and hands
@@ -27,6 +27,8 @@ pub enum Show {
     Folders,
     /// Show each path inside its parent folder, selected.
     Items,
+    /// Open the properties dialog for each path.
+    Properties,
 }
 
 /// One call from another application.
@@ -69,8 +71,7 @@ impl FileManager1 {
     }
 
     async fn show_item_properties(&self, uris: Vec<String>, startup_id: String) {
-        // there is no properties dialog yet: selecting the file is the closest thing
-        self.forward(Show::Items, uris, startup_id).await;
+        self.forward(Show::Properties, uris, startup_id).await;
     }
 }
 

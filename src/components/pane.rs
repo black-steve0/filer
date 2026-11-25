@@ -310,6 +310,23 @@ impl Pane {
             .map(|e| e.path.clone())
     }
 
+    /// The one item "Open With" acts on (nothing when several are marked).
+    pub fn open_with_target(&self) -> Option<PathBuf> {
+        let mut targets = self.target_paths();
+        (targets.len() == 1).then(|| targets.remove(0))
+    }
+
+    /// What Properties describes: the selected or marked items, or this folder itself
+    /// when nothing is selected (right-click on empty space).
+    pub fn properties_targets(&self) -> Vec<PathBuf> {
+        let targets = self.target_paths();
+        if targets.is_empty() {
+            vec![self.path.clone()]
+        } else {
+            targets
+        }
+    }
+
     pub fn selected_dir(&self) -> Option<PathBuf> {
         self.selected
             .and_then(|i| self.entries.get(i))

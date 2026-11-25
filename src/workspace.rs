@@ -3,18 +3,21 @@
 
 use crate::{
     actions::*,
+    apps,
     components::{
         conflict::{ConflictDialog, ConflictEvent},
         dnd::FileDrag,
         menubar::MenuBar,
+        open_with::{OpenWithDialog, OpenWithEvent},
         pane::{Pane, PaneEvent},
+        properties::{PropertiesDialog, PropertiesEvent},
         resize::grip,
         sidebar::{Sidebar, SidebarEvent},
         statusbar::StatusBar,
         toolbar::Toolbar,
     },
     dbus::{Request, Show},
-    dragout, model,
+    dragout, filetype, model,
     settings::{self, Settings, SettingsChanged},
     theme,
     transfer::{Progress, Transfer, TransferJob},
@@ -45,7 +48,10 @@ pub struct Workspace {
     /// A drop that hit a name clash: paused until the dialog below is answered.
     job: Option<TransferJob>,
     dialog: Option<(Entity<ConflictDialog>, Subscription)>,
-    /// Give the dialog keyboard focus on the next render.
+    /// "Open With" and "Properties" dialogs (at most one dialog of any kind is open).
+    open_with: Option<(Entity<OpenWithDialog>, Subscription)>,
+    props: Option<(Entity<PropertiesDialog>, Subscription)>,
+    /// Give the open dialog keyboard focus on the next render.
     focus_dialog: bool,
 }
 
@@ -88,6 +94,8 @@ impl Workspace {
             adopt_first_request: dbus_activated,
             job: None,
             dialog: None,
+            open_with: None,
+            props: None,
             focus_dialog: false,
         };
         for path in paths {
@@ -215,6 +223,13 @@ impl Workspace {
     /// none, a new pane opens next to the active one, so whatever the user is
     /// looking at stays put. The last target ends up active and focused.
     pub fn handle_request(&mut self, req: Request, window: &mut Window, cx: &mut Context<Self>) {
+        if req.kind == Show::Properties {
+            // "Properties" from another app: just the dialog, over whatever is on screen
+            self.show_properties(req.paths, cx);
+            window.activate_window();
+            crate::activation::activate(window, &req.startup_id);
+            return;
+        }
         // right after D-Bus activation the only pane is the default one nobody asked for
         let mut adopt = std::mem::take(&mut self.adopt_first_request) && self.panes.len() == 1;
         for path in req.paths {
@@ -319,8 +334,8 @@ fn on_pane(&mut self, pane: Entity<Pane>, event: &PaneEvent, cx: &mut Context<Se
     /// of something already in `dest`, the work pauses and the user is asked
     /// (rename / merge / replace / skip); see `on_conflict`.
     fn transfer(&mut self, paths: Vec<PathBuf>, dest: PathBuf, copy: bool, cx: &mut Context<Self>) {
-        if self.job.is_some() {
-            return; // the previous drop is still waiting for an answer
+        if self.modal_open() {
+            return; // the previous drop is still waiting for an answer (or another dialog is up)
         }
         let mut job = TransferJob::new(paths, dest, copy);
         let step = job.run();
@@ -363,6 +378,114 @@ fn on_pane(&mut self, pane: Entity<Pane>, event: &PaneEvent, cx: &mut Context<Se
         }
     }
 
+    // ---- Open With / Properties ----------------------------------------------
+
+    /// Is any dialog (name clash, Open With, Properties) on screen?
+    fn modal_open(&self) -> bool {
+        self.dialog.is_some() || self.open_with.is_some() || self.props.is_some()
+    }
+
+    /// Keyboard focus of whichever dialog is open.
+    fn modal_focus(&self, cx: &App) -> Option<FocusHandle> {
+        if let Some((d, _)) = &self.dialog {
+            Some(d.focus_handle(cx))
+        } else if let Some((d, _)) = &self.open_with {
+            Some(d.focus_handle(cx))
+        } else {
+            self.props.as_ref().map(|(d, _)| d.focus_handle(cx))
+        }
+    }
+
+    /// "Open With...": look up the installed applications for the selected item (off the
+    /// UI thread, it reads a few hundred small files), then show the dialog.
+    fn open_with(&mut self, cx: &mut Context<Self>) {
+        if self.modal_open() {
+            return;
+        }
+        let Some(path) = self.panes[self.active].read(cx).open_with_target() else { return };
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let mime = filetype::mime_for(&name, path.is_dir());
+        cx.spawn(async move |this, cx| {
+            let lookup = cx.background_executor().spawn(async move { apps::lookup(mime.as_deref()) }).await;
+            this.update(cx, |this, cx| this.show_open_with(path, lookup, cx)).ok();
+        })
+        .detach();
+    }
+
+    fn show_open_with(&mut self, path: PathBuf, lookup: apps::Lookup, cx: &mut Context<Self>) {
+        if self.modal_open() {
+            return; // something else came up while the lookup ran
+        }
+        let dialog = cx.new(|cx| OpenWithDialog::new(path, lookup, cx));
+        let sub = cx.subscribe(&dialog, Self::on_open_with);
+        self.open_with = Some((dialog, sub));
+        self.focus_dialog = true;
+        cx.notify();
+    }
+
+    fn on_open_with(&mut self, _: Entity<OpenWithDialog>, event: &OpenWithEvent, cx: &mut Context<Self>) {
+        self.open_with = None;
+        self.refocus = true; // keyboard focus goes back to the pane
+        if let OpenWithEvent::Open { app, path, mime, set_default } = event {
+            if let Err(msg) = apps::launch(app, std::slice::from_ref(path)) {
+                let pane = self.active_pane();
+                pane.update(cx, |p, cx| p.set_error(format!("Open With failed: {msg}"), cx));
+            }
+            if let (true, Some(mime)) = (*set_default, mime.clone()) {
+                let id = app.id.clone();
+                let name = app.name.clone();
+                cx.spawn(async move |this, cx| {
+                    let result = cx.background_executor().spawn(async move { apps::set_default(&id, &mime) }).await;
+                    if let Err(e) = result {
+                        this.update(cx, |this, cx| {
+                            let pane = this.active_pane();
+                            pane.update(cx, |p, cx| p.set_error(format!("Couldn't make {name} the default: {e}"), cx));
+                        })
+                        .ok();
+                    }
+                })
+                .detach();
+            }
+        }
+        cx.notify();
+    }
+
+    /// Properties of the selection (or of the folder itself when nothing is selected).
+    fn properties(&mut self, cx: &mut Context<Self>) {
+        let items = self.panes[self.active].read(cx).properties_targets();
+        self.show_properties(items, cx);
+    }
+
+    fn show_properties(&mut self, items: Vec<PathBuf>, cx: &mut Context<Self>) {
+        if self.modal_open() || items.is_empty() {
+            return;
+        }
+        let dialog = cx.new(|cx| PropertiesDialog::new(items, cx));
+        let sub = cx.subscribe(&dialog, Self::on_properties);
+        self.props = Some((dialog, sub));
+        self.focus_dialog = true;
+        cx.notify();
+    }
+
+    fn on_properties(&mut self, _: Entity<PropertiesDialog>, event: &PropertiesEvent, cx: &mut Context<Self>) {
+        match event {
+            PropertiesEvent::Close => {
+                self.props = None;
+                self.refocus = true;
+            }
+            // permissions changed: the listing (Perms column) shows the new value
+            PropertiesEvent::PermissionsChanged(path) => {
+                if let Some(parent) = path.parent() {
+                    let dirs = [parent.to_path_buf()];
+                    for pane in &self.panes {
+                        pane.update(cx, |p, cx| p.refresh_if_showing(&dirs, cx));
+                    }
+                }
+            }
+        }
+        cx.notify();
+    }
+
     /// Bring every pane that shows an affected folder up to date and report failures.
     fn finish_transfer(&mut self, result: Transfer, cx: &mut Context<Self>) {
         for pane in &self.panes {
@@ -390,8 +513,7 @@ impl Render for Workspace {
             self.focus_active(window, cx);
         }
         if std::mem::take(&mut self.focus_dialog) {
-            if let Some((dialog, _)) = &self.dialog {
-                let handle = dialog.focus_handle(cx);
+            if let Some(handle) = self.modal_focus(cx) {
                 window.focus(&handle);
             }
         }
@@ -545,11 +667,20 @@ impl Render for Workspace {
                 let pane = this.active_pane();
                 pane.update(cx, |p, cx| p.start_rename(window, cx));
             }))
+            .on_action(cx.listener(|this, _: &OpenWith, _, cx| this.open_with(cx)))
+            .on_action(cx.listener(|this, _: &ShowProperties, _, cx| this.properties(cx)))
+            // (these two are bound for the whole Workspace, so a dialog must ignore them)
             .on_action(cx.listener(|this, _: &FocusPath, window, cx| {
+                if this.modal_open() {
+                    return;
+                }
                 let pane = this.active_pane();
                 pane.update(cx, |p, cx| p.start_path_edit(window, cx));
             }))
             .on_action(cx.listener(|this, _: &GoToFolder, window, cx| {
+                if this.modal_open() {
+                    return;
+                }
                 let pane = this.active_pane();
                 pane.update(cx, |p, cx| p.start_jump(window, cx));
             }))
@@ -589,5 +720,7 @@ impl Render for Workspace {
             .children(cfg.show_statusbar.then(|| self.status.clone()))
             // last child = painted on top of everything: the "already exists" dialog
             .children(self.dialog.as_ref().map(|(dialog, _)| dialog.clone()))
+            .children(self.open_with.as_ref().map(|(dialog, _)| dialog.clone()))
+            .children(self.props.as_ref().map(|(dialog, _)| dialog.clone()))
     }
 }

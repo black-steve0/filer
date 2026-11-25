@@ -31,6 +31,7 @@ pub fn file_menu() -> Vec<MenuEntry> {
 pub fn edit_menu() -> Vec<MenuEntry> {
     vec![
         item("open", "Open", "Enter", OpenSelected),
+        item("open-with", "Open With...", "", OpenWith),
         item("open-other-pane", "Open in Other Pane", "", OpenInOtherPane),
         MenuEntry::Separator,
         item("cut", "Cut", "Ctrl+X", CutFile),
@@ -45,6 +46,7 @@ pub fn edit_menu() -> Vec<MenuEntry> {
         item("compress", "Compress to .tar.gz", "", CompressTarGz),
         item("extract", "Extract Archive", "", ExtractArchive),
         item("trash", "Move to Trash", "Del", MoveToTrash),
+        item("properties", "Properties", "Alt+Enter", ShowProperties),
         MenuEntry::Separator,
         item("find", "Filter...", "Ctrl+F", FindInPane),
     ]
@@ -108,12 +110,17 @@ pub fn multi_menu() -> Vec<MenuEntry> {
         item("compress", "Compress to .tar.gz", "", CompressTarGz),
         MenuEntry::Separator,
         item("trash", "Move to Trash", "Del", MoveToTrash),
+        MenuEntry::Separator,
+        item("properties", "Properties", "Alt+Enter", ShowProperties),
     ]
 }
 
 /// Right-click on a file or folder.
 pub fn row_menu(is_dir: bool, is_archive: bool) -> Vec<MenuEntry> {
-    let mut v = vec![item("open", "Open", "Enter", OpenSelected)];
+    let mut v = vec![
+        item("open", "Open", "Enter", OpenSelected),
+        item("open-with", "Open With...", "", OpenWith),
+    ];
     if is_dir {
         v.push(item("open-other-pane", "Open in Other Pane", "", OpenInOtherPane));
         v.push(item("terminal", "Open Terminal in This Folder", "", OpenTerminalInSelected));
@@ -136,6 +143,8 @@ pub fn row_menu(is_dir: bool, is_archive: bool) -> Vec<MenuEntry> {
     v.push(item("compress", "Compress to .tar.gz", "", CompressTarGz));
     v.push(MenuEntry::Separator);
     v.push(item("trash", "Move to Trash", "Del", MoveToTrash));
+    v.push(MenuEntry::Separator);
+    v.push(item("properties", "Properties", "Alt+Enter", ShowProperties));
     v.push(MenuEntry::Separator);
     v.push(item("new-file", "New File", "Ctrl+N", NewFile));
     v.push(item("new-folder", "New Folder", "Ctrl+Shift+N", NewFolder));
@@ -160,6 +169,8 @@ pub fn background_menu(show_hidden: bool) -> Vec<MenuEntry> {
         ),
         item("copy-path", "Copy Path", "Ctrl+Shift+C", CopyPath),
         item("add-place", "Add This Folder to Places", "", AddPlace),
+        MenuEntry::Separator,
+        item("properties", "Properties", "Alt+Enter", ShowProperties),
     ]
 }
 

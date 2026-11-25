@@ -136,6 +136,15 @@ const BUILTIN: &[(&str, &str)] = &[
     ("pdf", "application/pdf"), ("zip", "application/zip"), ("gz", "application/gzip"),
 ];
 
+/// The MIME type guessed from a file name alone (a folder is `inode/directory`).
+/// `None` when the name's extension isn't in the table.
+pub fn mime_for(file_name: &str, is_dir: bool) -> Option<String> {
+    if is_dir {
+        return Some("inode/directory".into());
+    }
+    mime_of(mime_table(), file_name).map(str::to_string)
+}
+
 /// Loaded once, the first time a MIME rule is checked. The system table is
 /// read first and the user's own (`~/.local/share/mime/globs2`, usually tiny)
 /// on top of it, so a few custom types do not hide all the others.
