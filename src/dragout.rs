@@ -91,14 +91,6 @@ pub fn available() -> bool {
     !DISABLED.load(Ordering::Relaxed) && matches!(CTX.get(), Some(Ok(_)))
 }
 
-/// Why drag-out is unavailable (for a message), if it is.
-pub fn unavailable_reason() -> Option<String> {
-    match CTX.get() {
-        Some(Err(e)) => Some(e.clone()),
-        _ => None,
-    }
-}
-
 fn setup(window: &Window) -> Result<Ctx, String> {
     let RawDisplayHandle::Wayland(d) = HasDisplayHandle::display_handle(window).map_err(|e| e.to_string())?.as_raw()
     else {
