@@ -7,12 +7,12 @@ use crate::{
 };
 use std::{
     io,
+    path::{Path, PathBuf},
+    process::Command,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
     },
-    path::{Path, PathBuf},
-    process::Command,
     time::SystemTime,
 };
 
@@ -35,7 +35,10 @@ fn make_entry(path: PathBuf, name: String) -> Entry {
     Entry {
         lname: name.to_lowercase(),
         kind: kind_label(&path, is_dir),
-        mode: meta.as_ref().map(|m| m.permissions().mode() & 0o777).unwrap_or(0),
+        mode: meta
+            .as_ref()
+            .map(|m| m.permissions().mode() & 0o777)
+            .unwrap_or(0),
         is_dir,
         size: meta.as_ref().map(|m| m.len()).unwrap_or(0),
         modified: meta.and_then(|m| m.modified().ok()),
@@ -141,7 +144,9 @@ fn scan(
 /// Blocking read of a whole directory, folders first (used by tests / tools).
 pub fn read_dir(path: &Path, show_hidden: bool) -> io::Result<Vec<Entry>> {
     let mut out = Vec::new();
-    scan(path, show_hidden, &AtomicBool::new(false), |c| out.extend(c))?;
+    scan(path, show_hidden, &AtomicBool::new(false), |c| {
+        out.extend(c)
+    })?;
     sort_entries(&mut out, SortKey::Name, true, true, false);
     Ok(out)
 }
@@ -190,8 +195,16 @@ impl DirLoader {
     pub fn poll(&self) -> (Vec<Entry>, bool, Option<String>) {
         // read `done` first: if it is set, the buffer already holds the rest
         let finished = self.done.load(Ordering::Acquire);
-        let batch = self.buf.lock().map(|mut b| std::mem::take(&mut *b)).unwrap_or_default();
-        let error = if finished { self.error.lock().ok().and_then(|mut e| e.take()) } else { None };
+        let batch = self
+            .buf
+            .lock()
+            .map(|mut b| std::mem::take(&mut *b))
+            .unwrap_or_default();
+        let error = if finished {
+            self.error.lock().ok().and_then(|mut e| e.take())
+        } else {
+            None
+        };
         (batch, finished, error)
     }
 }
@@ -233,7 +246,11 @@ pub fn open_external(path: &Path) {
 pub fn create_dir_unique(parent: &Path) -> io::Result<PathBuf> {
     let mut n = 0;
     loop {
-        let name = if n == 0 { "New Folder".to_string() } else { format!("New Folder {n}") };
+        let name = if n == 0 {
+            "New Folder".to_string()
+        } else {
+            format!("New Folder {n}")
+        };
         let path = parent.join(&name);
         match std::fs::create_dir(&path) {
             Ok(()) => return Ok(path),
@@ -256,7 +273,9 @@ pub fn trash(path: &Path) -> io::Result<()> {
             Err(_) => continue,
         }
     }
-    Err(io::Error::other("no trash tool found (install glib's `gio` or `trash-cli`)"))
+    Err(io::Error::other(
+        "no trash tool found (install glib's `gio` or `trash-cli`)",
+    ))
 }
 
 /// Real program name of a terminal: follows symlinks (so Debian's
@@ -264,7 +283,9 @@ pub fn trash(path: &Path) -> io::Result<()> {
 /// gnome-terminal) and strips `.wrapper` / `.real` suffixes.
 fn terminal_name(cmd: &str) -> String {
     let plain = |p: &Path| {
-        p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
+        p.file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default()
     };
     let mut name = plain(Path::new(cmd));
     // look the command up on $PATH and follow its symlinks
@@ -272,7 +293,9 @@ fn terminal_name(cmd: &str) -> String {
         Some(PathBuf::from(cmd))
     } else {
         std::env::var_os("PATH").and_then(|paths| {
-            std::env::split_paths(&paths).map(|d| d.join(cmd)).find(|p| p.is_file())
+            std::env::split_paths(&paths)
+                .map(|d| d.join(cmd))
+                .find(|p| p.is_file())
         })
     };
     if let Some(real) = found.and_then(|p| std::fs::canonicalize(p).ok()) {
@@ -308,9 +331,23 @@ pub fn open_terminal(dir: &Path, custom: &str) -> Result<(), String> {
     }
     candidates.extend(
         [
-            "x-terminal-emulator", "xdg-terminal-exec", "gnome-terminal", "kgx", "ptyxis",
-            "konsole", "kitty", "alacritty", "foot", "xfce4-terminal", "wezterm",
-            "tilix", "terminator", "lxterminal", "mate-terminal", "xterm", "st",
+            "x-terminal-emulator",
+            "xdg-terminal-exec",
+            "gnome-terminal",
+            "kgx",
+            "ptyxis",
+            "konsole",
+            "kitty",
+            "alacritty",
+            "foot",
+            "xfce4-terminal",
+            "wezterm",
+            "tilix",
+            "terminator",
+            "lxterminal",
+            "mate-terminal",
+            "xterm",
+            "st",
         ]
         .map(String::from),
     );
@@ -345,6 +382,12 @@ pub fn open_terminal(dir: &Path, custom: &str) -> Result<(), String> {
             }
             "wezterm" | "wezterm-gui" => {
                 cmd.arg("start").arg("--cwd").arg(&d);
+            }
+            "ghostty" => {
+                println!("ghostyy");
+                cmd.arg("+new-window")
+                    .arg("--working-directory")
+                    .arg(&d);
             }
             _ => {} // xterm, st, ...: inherit the cwd
         }
@@ -424,21 +467,36 @@ fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
 /// order within each group. `natural` orders digit runs numerically.
 pub fn sort_entries(v: &mut [Entry], key: SortKey, asc: bool, folders_first: bool, natural: bool) {
     v.sort_by(|a, b| {
-        let group = if folders_first { b.is_dir.cmp(&a.is_dir) } else { std::cmp::Ordering::Equal };
+        let group = if folders_first {
+            b.is_dir.cmp(&a.is_dir)
+        } else {
+            std::cmp::Ordering::Equal
+        };
         group.then_with(|| {
             let by_name = || {
-                if natural { natural_cmp(&a.lname, &b.lname) } else { a.lname.cmp(&b.lname) }
+                if natural {
+                    natural_cmp(&a.lname, &b.lname)
+                } else {
+                    a.lname.cmp(&b.lname)
+                }
             };
             let o = match key {
                 SortKey::Name => by_name(),
                 SortKey::Type => a.kind.cmp(&b.kind).then_with(by_name),
                 SortKey::Size => {
-                    let (x, y) = (if a.is_dir { 0 } else { a.size }, if b.is_dir { 0 } else { b.size });
+                    let (x, y) = (
+                        if a.is_dir { 0 } else { a.size },
+                        if b.is_dir { 0 } else { b.size },
+                    );
                     x.cmp(&y).then_with(by_name)
                 }
                 SortKey::Modified => a.modified.cmp(&b.modified).then_with(by_name),
             };
-            if asc { o } else { o.reverse() }
+            if asc {
+                o
+            } else {
+                o.reverse()
+            }
         })
     });
 }
@@ -449,9 +507,17 @@ pub fn sort_entries(v: &mut [Entry], key: SortKey, asc: bool, folders_first: boo
 pub fn create_file_unique(parent: &Path) -> io::Result<PathBuf> {
     let mut n = 0;
     loop {
-        let name = if n == 0 { "New File".to_string() } else { format!("New File {n}") };
+        let name = if n == 0 {
+            "New File".to_string()
+        } else {
+            format!("New File {n}")
+        };
         let path = parent.join(&name);
-        match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
             Ok(_) => return Ok(path),
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => n += 1,
             Err(e) => return Err(e),
@@ -474,7 +540,9 @@ pub fn file_clip() -> Option<(Vec<PathBuf>, bool)> {
 
 /// Copy or move `src` into `dir`. Returns the new path.
 pub fn paste(src: &Path, cut: bool, dir: &Path) -> io::Result<PathBuf> {
-    let name = src.file_name().ok_or_else(|| io::Error::other("bad source path"))?;
+    let name = src
+        .file_name()
+        .ok_or_else(|| io::Error::other("bad source path"))?;
     if dir.starts_with(src) {
         return Err(io::Error::other("can't paste a folder into itself"));
     }
@@ -517,7 +585,6 @@ pub fn drag_out(paths: &[PathBuf]) -> Result<(), String> {
     Err("no drag-out helper found (install ripdrag or dragon-drop)".into())
 }
 
-
 // ---- archives (compress / extract) ------------------------------------------
 //
 // Done with the usual command-line tools, so there are no extra crates: the
@@ -530,18 +597,26 @@ pub enum Archive {
     TarGz,
 }
 
-const TAR_EXTS: [&str; 7] = [".tar.gz", ".tar.bz2", ".tar.xz", ".tar.zst", ".tgz", ".tbz2", ".txz"];
+const TAR_EXTS: [&str; 7] = [
+    ".tar.gz", ".tar.bz2", ".tar.xz", ".tar.zst", ".tgz", ".tbz2", ".txz",
+];
 const SINGLE_EXTS: [&str; 4] = [".gz", ".bz2", ".xz", ".zst"];
 const OTHER_EXTS: [&str; 4] = [".zip", ".7z", ".rar", ".tar"];
 
 fn has_ext(name: &str, ext: &str) -> bool {
     name.len() >= ext.len()
-        && name.get(name.len() - ext.len()..).is_some_and(|t| t.eq_ignore_ascii_case(ext))
+        && name
+            .get(name.len() - ext.len()..)
+            .is_some_and(|t| t.eq_ignore_ascii_case(ext))
 }
 
 /// Does the file name look like something `extract` can open?
 pub fn is_archive(name: &str) -> bool {
-    TAR_EXTS.iter().chain(&SINGLE_EXTS).chain(&OTHER_EXTS).any(|e| has_ext(name, e))
+    TAR_EXTS
+        .iter()
+        .chain(&SINGLE_EXTS)
+        .chain(&OTHER_EXTS)
+        .any(|e| has_ext(name, e))
 }
 
 /// "photos.tar.gz" -> "photos"
@@ -558,7 +633,11 @@ fn strip_archive_ext(name: &str) -> String {
 fn free_name(dir: &Path, stem: &str, ext: &str) -> String {
     let mut n = 1;
     loop {
-        let name = if n == 1 { format!("{stem}{ext}") } else { format!("{stem} {n}{ext}") };
+        let name = if n == 1 {
+            format!("{stem}{ext}")
+        } else {
+            format!("{stem} {n}{ext}")
+        };
         if !dir.join(&name).exists() {
             return name;
         }
@@ -576,12 +655,18 @@ fn try_tools(cwd: &Path, tools: &[(&str, Vec<String>)], hint: &str) -> Result<()
             .output()
         {
             // unzip exits 1 for harmless warnings
-            Ok(out) if out.status.success() || (*tool == "unzip" && out.status.code() == Some(1)) => {
+            Ok(out)
+                if out.status.success() || (*tool == "unzip" && out.status.code() == Some(1)) =>
+            {
                 return Ok(())
             }
             Ok(out) => {
                 let err = String::from_utf8_lossy(&out.stderr);
-                let last = err.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("unknown error");
+                let last = err
+                    .lines()
+                    .rev()
+                    .find(|l| !l.trim().is_empty())
+                    .unwrap_or("unknown error");
                 return Err(format!("{tool}: {}", last.trim()));
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
@@ -594,7 +679,11 @@ fn try_tools(cwd: &Path, tools: &[(&str, Vec<String>)], hint: &str) -> Result<()
 /// Compress a file or folder next to itself ("name.zip" / "name.tar.gz").
 pub fn compress(src: &Path, kind: Archive) -> Result<PathBuf, String> {
     let parent = src.parent().ok_or("bad path")?;
-    let name = src.file_name().ok_or("bad path")?.to_string_lossy().into_owned();
+    let name = src
+        .file_name()
+        .ok_or("bad path")?
+        .to_string_lossy()
+        .into_owned();
     compress_names(parent, &name, std::slice::from_ref(&name), kind)
 }
 
@@ -611,7 +700,12 @@ pub fn compress_many(srcs: &[PathBuf], kind: Archive) -> Result<PathBuf, String>
                 if src.parent() != Some(parent) {
                     return Err("the items are in different folders".into());
                 }
-                names.push(src.file_name().ok_or("bad path")?.to_string_lossy().into_owned());
+                names.push(
+                    src.file_name()
+                        .ok_or("bad path")?
+                        .to_string_lossy()
+                        .into_owned(),
+                );
             }
             let base = parent
                 .file_name()
@@ -623,7 +717,12 @@ pub fn compress_many(srcs: &[PathBuf], kind: Archive) -> Result<PathBuf, String>
 }
 
 /// Pack `names` (all inside `parent`) into a new archive called `base` + extension.
-fn compress_names(parent: &Path, base: &str, names: &[String], kind: Archive) -> Result<PathBuf, String> {
+fn compress_names(
+    parent: &Path,
+    base: &str,
+    names: &[String],
+    kind: Archive,
+) -> Result<PathBuf, String> {
     let (ext, hint) = match kind {
         Archive::Zip => (".zip", "zip, bsdtar or 7z"),
         Archive::TarGz => (".tar.gz", "tar"),
@@ -657,7 +756,11 @@ fn compress_names(parent: &Path, base: &str, names: &[String], kind: Archive) ->
 /// archive full of loose files can never litter the current folder.
 pub fn extract(archive: &Path) -> Result<PathBuf, String> {
     let parent = archive.parent().ok_or("bad path")?;
-    let name = archive.file_name().ok_or("bad path")?.to_string_lossy().into_owned();
+    let name = archive
+        .file_name()
+        .ok_or("bad path")?
+        .to_string_lossy()
+        .into_owned();
     let dest = parent.join(free_name(parent, &strip_archive_ext(&name), ""));
     std::fs::create_dir(&dest).map_err(|e| format!("can't create folder: {e}"))?;
 
@@ -735,9 +838,14 @@ fn decompress_single(tool: &str, archive: &Path, out: &Path) -> Result<(), Strin
         Ok(o) if o.status.success() => Ok(()),
         Ok(o) => {
             let err = String::from_utf8_lossy(&o.stderr);
-            Err(format!("{tool}: {}", err.lines().next().unwrap_or("failed").trim()))
+            Err(format!(
+                "{tool}: {}",
+                err.lines().next().unwrap_or("failed").trim()
+            ))
         }
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Err(format!("no tool found, install {tool}")),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            Err(format!("no tool found, install {tool}"))
+        }
         Err(e) => Err(format!("{tool}: {e}")),
     }
 }
